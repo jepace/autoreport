@@ -1,29 +1,18 @@
 import pyautogui, time, os
 import wx, sys, re
+import win32gui
+import os   # to get the environment variables
+
+# Installation instructions: 
+# On Windows 10, install python via MS Store.  
+# Install pyautogui via pip install pyautogui
+# Install wx via pip install wxPython
+# Install win32gui via pip install pywin32
 
 # NB: 0.1 is too fast. 1 works. Does 0.25?
-pyautogui.PAUSE = 0.25
+pyautogui.PAUSE = 0.3
 
 reports = [ 'P-L YTD Comp', 'Balance Sheet Detail', 'Balance Sheet Summary', 'AP Aging Detail', 'Transaction Detail by acct' ]
-
-# FIXME: Ask for dates. What's the scope of these variables?
-global startDate, endDate, fileDate
-
-class MyFrame(wx.Frame):
-    def __init__(self, parent):
-        wx.Frame.__init__(self, parent, -1, "Output",size=(500,400))
-        self.panel = wx.Panel(self)
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        self.log = wx.TextCtrl(self.panel, wx.ID_ANY, size=(400,300),style = wx.TE_MULTILINE|wx.TE_READONLY|wx.VSCROLL)
-        self.button = wx.Button(self.panel, label="Done")
-        sizer.Add(self.log, 0, wx.EXPAND | wx.ALL, 10)
-        sizer.Add(self.button, 0, wx.EXPAND | wx.ALL, 10)
-        self.panel.SetSizer(sizer)
-        self.Bind(wx.EVT_BUTTON, self.OnButton)
-        
-    def OnButton(self,event):
-        self.Destroy()
-        sys.exit()
 
 class GetInput(wx.Dialog):
     def __init__(self, parent):
@@ -53,77 +42,89 @@ class GetInput(wx.Dialog):
         regex = re.compile( r"^\d+/\d+/\d+$")
         if regex.match (self.StartDate):
             startDate = self.StartDate
-            # frame.log.AppendText ("Start Date: " + startDate + "\n")
+            # print ("Start Date: " + startDate + "\n")
         else:
             startDate = ""
-            frame.log.AppendText("Error: Bad start date format: " + self.StartDate + "\n" )
+            print("Error: Bad start date format: " + self.StartDate)
+
         if regex.match (self.EndDate):
             endDate = self.EndDate
             sp = endDate.split("/")
             fileDate = str(int(sp[2])%100).zfill(2) + sp[0].zfill(2) + sp[1].zfill(2)
-            # frame.log.AppendText ("End Date: " + endDate + " [" + fileDate + "]\n")
+            # print ("End Date: " + endDate + " [" + fileDate + "]\n")
         else:
-            frame.log.AppendText("Error: Bad end date format: " + self.EndDate + "\n" )
+            print("Error: Bad end date format: " + self.EndDate)
+            time.sleep(10)
             endDate = ""
             fileDate = ""
         self.Destroy()
 
-# Create the output window, named 'frame'
-app = wx.App()
-frame = MyFrame(None)
-frame.Show()
-
 # Get the date input
-dlg = GetInput(parent = frame.panel) 
+app = wx.App()
+dlg = GetInput(None) 
 dlg.ShowModal()
-frame.log.AppendText("[M] Start Date: " + startDate + "\n")
-frame.log.AppendText("[M] End Date: " + endDate + "\n")
-frame.log.AppendText("[M] File Date: " + fileDate + "\n")
+
+print("[M] Start Date: " + startDate)
+print("[M] End Date: " + endDate)
+print("[M] File Date: " + fileDate)
 
 if not startDate or not endDate:
-    frame.log.AppendText("User input not found. Exiting.\n")
+    print("** ERROR ** User input not valid. Exiting.")
+    time.sleep(10)
     sys.exit()
 
-# app.MainLoop()
-"""
-Pay special attention to the result items
-"""
-
 # Make sure output directory exists
-outputDir = 'C:\\Users\\jepace\\Documents\\Pembrook\\Finance\\Pembrook\\auto\\'
+drive = os.environ["HOMEDRIVE"]
+homedir = os.environ["HOMEPATH"]
+outputDir = drive + homedir + '\\Documents\\Pembrook\\Finance\\Pembrook\\auto\\'
+print ("Output directory: " + outputDir)
+
 if not os.path.exists(outputDir):
     os.makedirs (outputDir)
 
-frame.log.AppendText("Ensure QuickBooks is open. Be sure all instances of Excel are closed.\n")
-frame.log.AppendText('>>> 5 SECOND PAUSE.  Switch to Quickbooks or hit Ctrl-C <<<\n')
-time.sleep(5)
-
-# FIXME: Select Quickbooks (and Excel) for real, not just assume they will be in focus
-#hwnd = win32gui.FindWindow("","QuickBooks")
-#win32gui.SetFocus(hwmd)
+#print("Ensure QuickBooks is open. Be sure all instances of Excel are closed.")
+#print('>>> 5 SECOND PAUSE: Switch to Quickbooks or hit Ctrl-C <<<')
+#time.sleep(5)
 
 for i in range (0, 5):
-    frame.log.AppendText ("Loop: " + reports[i] + "\n")
-    frame.Update()
+    # Let's attempt to bring focus to Quickbooks
+    hwnd = pyautogui.getWindowsWithTitle("QuickBooks Desktop Pro 2020")[0]
+    hwnd.restore()
+    win32gui.SetForegroundWindow(hwnd._hWnd)
+
+    print ("Loop " + str(i) + ": " + reports[i])
+    time.sleep(1)
+
+    pyautogui.hotkey('esc')     # Clear previous report, if there
 
     # Run the report
     pyautogui.hotkey('alt', 'r')
     pyautogui.hotkey('down')
     pyautogui.hotkey('down')
     pyautogui.hotkey('down')
+    pyautogui.hotkey('down')    # QB2020 added another menu option
     pyautogui.hotkey('right')
     for j in range (0, i):
         pyautogui.hotkey ('down')
     pyautogui.hotkey('enter')
+    time.sleep(2)
     pyautogui.hotkey('tab')
 
-    # NB: Balance Sheet Summary and A/P Aging only have 1 date field
+    # NB: "Balance Sheet Summary" [2] and "A/P Aging" [3] only have 1 date field
     if (i != 2 and i != 3 ):
         pyautogui.typewrite(startDate)
         pyautogui.hotkey('tab')
 
     pyautogui.typewrite(endDate)
     pyautogui.hotkey('tab')
+
+    # Fuck Intuit.  To update the A/P Aging report, you've got to tab a 
+    # couple more times.
+    if (i == 3):
+        pyautogui.hotkey('tab')
+        pyautogui.hotkey('tab')
+
+    time.sleep(1)
 
     # Ask for Excel version of report
     pyautogui.hotkey('alt', 'x')
@@ -135,23 +136,40 @@ for i in range (0, 5):
     filename = outputDir+"Pembrook "+fileDate+" "+reports[i]+".xlsx"
     if os.path.isfile(filename):
         os.remove(filename)
-    frame.log.AppendText ("Report: " + filename + "\n")
+    print ("Report: " + filename)
 
-    # Wait for Excel to launch
-    frame.log.AppendText ("Sleeping while Excel loads...")
-    frame.Update()
-    time.sleep (90)
-    frame.log.AppendText ("Awake!\n")
+    # Wait for Excel to launch.  For the large report, it really does
+    # take a long time, so 90 secs is right.  (This makes debugging a
+    # pain, so you might want to alter it for testing.)
+    print ("Sleeping a long time while Excel loads...")
+    time.sleep (20)
+    #print ("Awake!")
     
+    # Switch to the Excel program.
+    hwnd = pyautogui.getWindowsWithTitle("Excel")[0]
+    win32gui.SetForegroundWindow(hwnd._hWnd)
+
     # In Excel, save the report
     pyautogui.hotkey('F12')
     time.sleep (1)
     pyautogui.typewrite(filename)
     pyautogui.hotkey('enter')
+    pyautogui.hotkey('enter')   # To get past some dialog about macros in 2020
+    
+    # Exit Excel (FIXME 201019 - Excel not closing; increase this
+    # sleep from 2 to 5 secs)
+    time.sleep (5)
     pyautogui.hotkey('alt', 'F4')
-
-    # Should be back in Quickbooks.  Clear the report away and do it again.
-    time.sleep (1)
-    pyautogui.hotkey('esc')
 # End Loop
-frame.log.AppendText ("Done!\n")
+
+#print ("Done!")
+
+# Reopen the home screen in Quickbooks
+hwnd = pyautogui.getWindowsWithTitle("QuickBooks Desktop Pro 2020")[0]
+win32gui.SetForegroundWindow(hwnd._hWnd)
+pyautogui.hotkey('esc')     # Clear previous report, if there
+pyautogui.hotkey('alt', 'c')
+pyautogui.hotkey('enter')
+
+print ("And we're out of here!")
+time.sleep (3)
