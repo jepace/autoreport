@@ -5,9 +5,9 @@ import os   # to get the environment variables
 
 # Installation instructions: 
 # On Windows 10, install python via MS Store.  
-# Install pyautogui via pip install pyautogui
-# Install wx via pip install wxPython
-# Install win32gui via pip install pywin32
+# Install pyautogui via "pip install pyautogui"
+# Install wx via "pip install wxPython"
+# Install win32gui via "pip install pywin32"
 
 # NB: 0.1 is too fast. 1 works. Does 0.25?
 pyautogui.PAUSE = 0.3
@@ -133,7 +133,9 @@ for i in range (0, 5):
     pyautogui.hotkey('enter')
 
     # Delete file before trying to create it
-    filename = outputDir+"Pembrook "+fileDate+" "+reports[i]+".xlsx"
+    # 7/29/22: Removing extension? 
+    # filename = outputDir+"Pembrook "+fileDate+" "+reports[i]+".xlsm"
+    filename = outputDir+"Pembrook "+fileDate+" "+reports[i]
     if os.path.isfile(filename):
         os.remove(filename)
     print ("Report: " + filename)
@@ -150,6 +152,7 @@ for i in range (0, 5):
     win32gui.SetForegroundWindow(hwnd._hWnd)
 
     # In Excel, save the report
+    # XXX 7/25/22: F12 leads to macro problems during save
     pyautogui.hotkey('F12')
     time.sleep (1)
     pyautogui.typewrite(filename)
