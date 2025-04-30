@@ -172,53 +172,72 @@ if not os.path.exists(outputDir):
 
 # Begin looping over the reports
 # FIXME: range(0,5) should be replaced with iterator of reports array
-for i in range (0, 5):
+for i, report in enumerate(reports):
     # Let's attempt to bring focus to Quickbooks
     RaiseWindow("QuickBooks Desktop Pro 2020")
     dprint("QB Foregrounded")
 
-    print (f'Loop {str(i)}: {reports[i]}')
+    print (f'Loop {i}: {report}')
     time.sleep(0.5)
 
     # Run the report
     pyautogui.press('esc')          # Clear previous report, if there (or close home page)
+    dprint("esc")
     pyautogui.hotkey('alt', 'r')    # Open Reports menu
+    dprint('alt-r')
     pyautogui.press('down')         # To memorized reports
+    dprint('down')
     pyautogui.press('down')         # To scheduled reports
+    dprint('down')
     pyautogui.press('down')         # To commented reports
+    dprint('down')
     pyautogui.press('down')         # To Favorite Reports (yay!)
+    dprint('down')
     pyautogui.press('right')        # Enter Favorite Reports
-    for j in range (0, i):
-        pyautogui.press ('down')    # Move to desired report
+    dprint('right')
+    for _ in range (i):
+        pyautogui.press ('down')    # Move to desired report, which is the index of that report in reports
+        dprint('down')
     pyautogui.press('enter')        # Select desired report
+    dprint('enter')
     time.sleep(2)                   # Give time for desired report to load
     pyautogui.press('tab')          # Move to the Starting Date field
+    dprint('tab')
 
     # NB: "Balance Sheet Summary" [2] and "A/P Aging" [3] only have 1 date field
     # FIXME: Don't hard code which are special
-    if (i != 2 and i != 3 ):
+    if report not in ("Balance Sheet Summary", "AP Aging Detail"):
         pyautogui.typewrite(startDate)
+        dprint(f'Typed: {startDate}')
         pyautogui.press('tab')      # Move to Ending Date field
+        dprint('tab')
 
     pyautogui.typewrite(endDate)
+    dprint(f'Typed: {endDate}')
     pyautogui.press('tab')          # Move out of date field so it registers
+    dprint('tab')
 
     # XXX: Fuck Intuit.  To update the A/P Aging report, you've got to tab a 
     # couple more times.
-    if (i == 3):
+    if report == "AP Aging Detail":
         pyautogui.press('tab')
+        dprint('tab [APAD]')
         pyautogui.press('tab')
+        dprint('tab [APAD]')
 
     time.sleep(1)                   # Give a chance to catch up
 
     # Ask for Excel version of report
     pyautogui.hotkey('alt', 'x')
+    dprint('alt-x')
     pyautogui.press('n')
+    dprint('n')
     time.sleep (2)
     pyautogui.press('enter')
+    dprint('enter')
 
     # No extension here as it is added automatically 
-    filename = os.path.join(outputDir, "Pembrook " + fileDate + " " + reports[i])
+    filename = os.path.join(outputDir, "Pembrook " + fileDate + " " + report)
     
     # Delete file before trying to create it
     # NB: Since we don't have the extension, let's nuke a couple options
@@ -228,16 +247,17 @@ for i in range (0, 5):
             dprint(f'Removed: "{filename}.{ext}"')
     print (f'Report: "{filename}"')
 
-    RaiseWindow("Excel", 120)    # Give long delay for Excel, as it might take a while
+    RaiseWindow("Excel", 300)    # Give long delay for Excel, as it might take a while
     
     # In Excel, Save via the Save As window
     time.sleep(0.5)
     pyautogui.press('f12')                  # Ask for the Save As window
+    dprint('f12')
     #time.sleep(0.5)
     RaiseWindow("Save As")                  # Switch to to the Save As window
     time.sleep(0.5)
     pyautogui.typewrite(f"{filename}")      # Write the filename in 'File name'
-    dprint(f'Typewrote "{filename}"')
+    dprint(f'Typed "{filename}"')
     time.sleep(0.5)
     pyautogui.press('tab')                  # Move to 'Save as type'
     dprint("tab")
@@ -252,7 +272,7 @@ for i in range (0, 5):
     pyautogui.hotkey('alt','s')             # Save the file
     dprint("alt-s")
     
-    if WaitCloseWindow("Save As", 60):
+    if WaitCloseWindow("Save As", 90):
         dprint(f'Saved "{filename}"')
     else:
         print(f'** ERROR: Window "Save As" did not close')
@@ -261,7 +281,7 @@ for i in range (0, 5):
     
     # Exit Excel
     RaiseWindow("Excel")                    # Make sure Excel is our focus
-    time.sleep(15)                          # Sometimes, it is still processing, which breaks things. OneDrive?
+    time.sleep(10)                          # Sometimes, it is still processing, which breaks things. OneDrive?
     pyautogui.hotkey('alt', 'f4')           # Exit Excel
     dprint("alt-f4")
     time.sleep(1)
