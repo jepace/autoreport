@@ -45,6 +45,7 @@ import pyautogui
 import pywintypes
 import win32com.client
 import win32gui
+import win32process
 import wx
 
 # ============================================================================
@@ -368,6 +369,36 @@ def wait_until(condition, timeout, what, soft=False, minimum=0, on_miss=None):
         time.sleep(0.2)
 
 
+def qb_dialogs():
+    '''{hwnd: title} of visible top-level windows owned by QuickBooks other
+    than its main window -- i.e. its dialogs.'''
+    qb = find_window(QB_TITLE)
+    if not qb:
+        return {}
+    _, pid = win32process.GetWindowThreadProcessId(qb._hWnd)
+    found = {}
+    def collect(hwnd, _):
+        if (hwnd != qb._hWnd and win32gui.IsWindowVisible(hwnd)
+                and win32process.GetWindowThreadProcessId(hwnd)[1] == pid):
+            found[hwnd] = win32gui.GetWindowText(hwnd)
+    try:
+        win32gui.EnumWindows(collect, None)
+    except Exception:
+        pass
+    return found
+
+
+def qb_dialog_opened(before):
+    '''Description of a QB dialog that wasn't open in `before`, or None.
+    A modal dialog also disables QB's main window, so that counts too.'''
+    new = {h: t for h, t in qb_dialogs().items() if h not in before}
+    if new:
+        return 'new window: ' + ' | '.join(repr(t) for t in new.values())
+    if qb_busy():
+        return 'QuickBooks main window disabled (modal dialog)'
+    return None
+
+
 def log_qb_windows():
     '''Diagnostics: log the visible windows inside QuickBooks.'''
     titles = list(dict.fromkeys(text for _, text in qb_inner_windows()))
@@ -586,7 +617,8 @@ def check_report_dates(wb, report, end):
     hasn't been confirmed. Each run logs what it found.)'''
     texts = []
     try:
-        ws = wb.Worksheets(1)
+        ws = next(wb.Worksheets(i) for i in range(1, wb.Worksheets.Count + 1)
+                  if not is_tips_sheet(wb.Worksheets(i).Name))
         for row in excel_call(lambda: ws.Range('A1:H8').Value) or ():
             texts += [str(v) for v in row if v not in (None, '')]
         setup = ws.PageSetup
@@ -690,15 +722,27 @@ def qb_open_report(index, report, start, end):
     pyautogui.write(fmt_date(end))
     log.debug(f'   typed {fmt_date(end)}')
     press('tab', *['tab'] * report.extra_tabs)  # leave field so QB refreshes
-    time.sleep(1)                              # no window signal for the refresh
+    time.sleep(2)                              # QB ignores keys while refreshing
 
 
 def qb_export():
     '''Step 2: ask QuickBooks to send the report to a new Excel workbook.'''
     log.debug('Step 2: export to Excel')
-    # The "Send Report to Excel" dialog isn't a separate window we can see,
-    # so this uses the original script's proven timing.
-    hotkey('alt', 'x')
+    # Never type into the export dialog unless it has visibly opened: if QB
+    # was still busy and ignored Alt+X, the "n" would land in the report
+    # itself (it once changed "Sort By" to "Num").
+    before = qb_dialogs()
+    for attempt in (1, 2):
+        hotkey('alt', 'x')
+        opened = wait_until(lambda: qb_dialog_opened(before), 8,
+                            f'"Send Report to Excel" dialog (attempt {attempt})', soft=True)
+        if opened:
+            log.debug(f'   export dialog: {opened}')
+            break
+        time.sleep(2)                          # QB may still be busy; try once more
+    else:
+        raise AutoReportError('QuickBooks did not open "Send Report to Excel" after '
+                              'Alt+X (twice). Stopped so no keys land in the report.')
     time.sleep(1)
     press('n')                                 # "Create new worksheet"
     time.sleep(2)
