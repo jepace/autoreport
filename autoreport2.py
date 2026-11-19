@@ -57,18 +57,27 @@ import wx
 
 @dataclass
 class Report:
-    name: str              # Name in QB's Favorite Reports (also the tab name)
-    title: str             # Title QB gives the report's window (see the log)
+    name: str              # Name in QB's Favorite Reports (for reference only)
+    title: str             # Title QB prints on the report and gives its window
     date_fields: int = 2   # 2 = From/To, 1 = single "as of" date
     extra_tabs: int = 0    # Extra tabs needed after the last date to refresh
+    as_of: bool = None     # Header reads "As of <end>" (default: if 1 date field)
+    tab: str = None        # Tab name in the combined workbook (default: title)
+
+    def __post_init__(self):
+        if self.as_of is None:
+            self.as_of = self.date_fields == 1
+        self.tab = self.tab or self.title
 
 # Order MUST match the order in QuickBooks: Reports > Favorite Reports.
-# The combined workbook's tabs are in this order too.
+# The combined workbook's tabs are in this order too, named after QB's titles.
 REPORTS = [
     Report('P-L YTD Comp', 'Profit & Loss YTD Comparison'),
-    Report('Balance Sheet Detail', 'Balance Sheet Detail'),   # title not yet confirmed
+    # Point-in-time report: QB headers it "As of <end>" despite From/To fields
+    Report('Balance Sheet Detail', 'Balance Sheet Detail', as_of=True),
     Report('Balance Sheet Summary', 'Summary Balance Sheet', date_fields=1),
-    Report('AP Aging Detail', 'A/P Aging Detail', date_fields=1, extra_tabs=2),
+    Report('AP Aging Detail', 'A/P Aging Detail', date_fields=1, extra_tabs=2,
+           tab='AP Aging Detail'),              # Excel tab names can't contain "/"
     Report('Transaction Detail by acct', 'Transaction Detail by Account'),
 ]
 
@@ -396,7 +405,9 @@ def qb_dialog_opened(before):
     A modal dialog also disables QB's main window, so that counts too.'''
     new = {h: t for h, t in qb_dialogs().items() if h not in before}
     if new:
-        return 'new window: ' + ' | '.join(repr(t) for t in new.values())
+        # Window class names show what these untitled windows really are.
+        return 'new windows: ' + ' | '.join(
+            f'{t!r} [{win32gui.GetClassName(h)}]' for h, t in new.items())
     if qb_busy():
         return 'QuickBooks main window disabled (modal dialog)'
     return None
@@ -633,20 +644,21 @@ def check_report_dates(wb, report, start, end):
                   if not is_tips_sheet(wb.Worksheets(i).Name))
         header = excel_call(lambda: page_header_text(ws))
     except (pywintypes.com_error, StopIteration) as e:
-        log.warning(f'   ** {report.name}: could not read the page header to check dates ({e})')
+        log.warning(f'   ** {report.title}: could not read the page header to check dates ({e})')
         return
     s_month, e_month = _MONTHS[start.month - 1], _MONTHS[end.month - 1]
-    if report.date_fields == 1:
-        ok = f'{e_month} {end.day}, {end.year}' in header
+    if report.as_of:
+        expected = f'As of {e_month} {end.day}, {end.year}'
+        ok = expected in header
     else:
+        expected = f'{s_month} through {e_month} {end.year}'
         ok = bool(re.search(rf'\b{s_month}( {start.day})? through {e_month}'
                             rf'( {end.day},)? {end.year}\b', header))
     if ok:
         log.debug(f'   dates ok: {header}')
     else:
-        log.warning(f'   ** {report.name}: page header does not show '
-                    f'{fmt_date(start) + " - " if report.date_fields == 2 else ""}'
-                    f'{fmt_date(end)} -- CHECK THE DATES. Header: {header or "(empty)"}')
+        log.warning(f'   ** {report.title}: expected "{expected}" in the page header '
+                    f'-- CHECK THE DATES. Header: {header or "(empty)"}')
 
 
 def save_and_close(xl, wb, target):
@@ -672,7 +684,7 @@ def sheet_name(text):
 def build_combined(saved, target):
     '''Copy the sheets of each saved report into one workbook, one tab per report.
 
-    saved: list of (report name, file path), in tab order.
+    saved: list of (tab name, file path), in tab order.
     Uses its own hidden Excel instance and always quits it.'''
     log.info(f'Combining {len(saved)} reports')
     xl = win32com.client.DispatchEx('Excel.Application')
@@ -749,7 +761,9 @@ def qb_export():
                             f'"Send Report to Excel" dialog (attempt {attempt})', soft=True)
         if opened:
             # Diagnostics: which signals fired, to learn which is reliable.
-            log.debug(f'   export dialog: {opened}; QB main window disabled: {qb_busy()}')
+            fg = win32gui.GetForegroundWindow()
+            log.debug(f'   export dialog: {opened}; focused window: '
+                      f'{win32gui.GetWindowText(fg)!r} [{win32gui.GetClassName(fg)}]')
             break
         time.sleep(2)                          # QB may still be busy; try once more
     else:
@@ -767,14 +781,19 @@ def excel_save(target, report, start, end):
     xl, wb = wait_for_export_workbook(EXPORT_TIMEOUT)
     check_report_dates(wb, report, start, end)
     save_and_close(xl, wb, target)
+    # Diagnostics: dropping our last link to Excel may wait for Excel to
+    # finish shutting down (suspected cause of a 10-15s pause per report).
+    t = time.time()
+    del xl, wb
+    log.debug(f'   released Excel ({time.time() - t:.1f}s)')
     wait_file_stable(target)
     wait_closed(is_excel_title, 30, 'Excel')   # soft: next report can still proceed
 
 
 def run_report(index, report, start, end, work_dir):
     '''Produce one report's workbook in work_dir; returns its path.'''
-    log.info(f'[{index + 1}/{len(REPORTS)}] {report.name}')
-    target = os.path.join(work_dir, f'{FILE_PREFIX} {file_date(end)} {report.name}.{FILE_EXT}')
+    log.info(f'[{index + 1}/{len(REPORTS)}] {report.title}')
+    target = os.path.join(work_dir, f'{FILE_PREFIX} {file_date(end)} {report.tab}.{FILE_EXT}')
     qb_open_report(index, report, start, end)
     qb_export()
     excel_save(target, report, start, end)
@@ -802,7 +821,7 @@ def run(year, quarter, reports_dir, work_dir):
     '''Make every report, combine them, and publish. Returns the published path.'''
     start, end = quarter_range(year, quarter)
     preflight()
-    saved = [(report.name, run_report(i, report, start, end, work_dir))
+    saved = [(report.tab, run_report(i, report, start, end, work_dir))
              for i, report in enumerate(REPORTS)]
     combined = os.path.join(work_dir,
                             f'{combined_name(year, quarter, dt.date.today())}.{FILE_EXT}')

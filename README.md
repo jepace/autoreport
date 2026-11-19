@@ -94,7 +94,7 @@ All settings are at the top of `autoreport2.py`:
 
 | Setting | What it controls |
 |---|---|
-| `REPORTS` | Reports in Favorites order: the Favorites name (also the tab name), the title QuickBooks gives the report's window, how many date fields it has (`date_fields`), and extra tabs needed to refresh (`extra_tabs`) |
+| `REPORTS` | Reports in Favorites order: the Favorites name (for reference), the title QuickBooks prints on the report (used to find its window, and as the tab name), how many date fields it has (`date_fields`), extra tabs needed to refresh (`extra_tabs`), whether its header reads "As of" (`as_of`), and an optional different tab name (`tab`) |
 | `QB_TITLE` | Part of the main QuickBooks window title |
 | `FAVORITES_MENU_DOWNS` | How far down the Reports menu "Favorite Reports" is |
 | `FILE_PREFIX` | First word of each file name |
