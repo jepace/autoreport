@@ -18,6 +18,7 @@ Runs the QuickBooks "Favorite Reports", exports each to Excel and saves it as
   its own automation interface (COM, via pywin32): no Save As dialog, no
   file-type dropdown, no prompts.  Saves plain .xlsx and removes the
   "QuickBooks Export Tips" sheet QB adds.
+* Also builds one combined workbook with every report as its own tab.
 * Waits for windows and for the saved file on disk, instead of fixed sleeps.
 * Every run writes a log to <output folder>/logs/.
 * Failures stop with a clear message; the console waits for Enter.
@@ -80,6 +81,11 @@ EXCEL_FORMATS = {'xlsx': 51, 'xlsm': 52}   # Excel's FileFormat codes
 # prefix of the sheet name. Never deletes the last remaining sheet.
 # Every run logs the sheet names it saw, so check the log if this needs tweaking.
 DROP_SHEETS = ('QuickBooks Export Tips',)
+
+# Also build one workbook with every report as its own tab (tabs named after
+# the reports, in REPORTS order). The separate files are still written.
+COMBINED_WORKBOOK = True
+COMBINED_NAME = 'All Reports'   # -> "Pembrook 260930 All Reports.xlsx"
 
 def default_output_dir():
     base = os.environ.get('OneDrive') or os.path.expanduser('~')
@@ -406,6 +412,51 @@ def save_and_close(xl, wb, target):
     del wb, xl                      # release COM references so Excel can exit
 
 
+def sheet_name(text):
+    '''Make text a legal Excel tab name (31 chars, no []:*?/\\).'''
+    for ch in '[]:*?/\\':
+        text = text.replace(ch, '-')
+    return text[:31]
+
+
+def build_combined(saved, target):
+    '''Copy the sheets of each saved report into one workbook, one tab per report.
+
+    saved: list of (report name, file path), in tab order.
+    Uses its own hidden Excel instance and always quits it.'''
+    log.info(f'Combining {len(saved)} reports into {target}')
+    xl = win32com.client.DispatchEx('Excel.Application')
+    try:
+        xl.Visible = False
+        xl.DisplayAlerts = False
+        combo = excel_call(lambda: xl.Workbooks.Add())
+        blanks = [combo.Worksheets(i).Name for i in range(1, combo.Worksheets.Count + 1)]
+        for name, path in saved:
+            src = excel_call(lambda: xl.Workbooks.Open(os.path.abspath(path), ReadOnly=True))
+            count = src.Worksheets.Count
+            for i in range(1, count + 1):
+                last = combo.Worksheets(combo.Worksheets.Count)
+                excel_call(lambda: src.Worksheets(i).Copy(Before=None, After=last))
+                copied = combo.Worksheets(combo.Worksheets.Count)
+                copied.Name = sheet_name(name if count == 1 else f'{name} {i}')
+                log.debug(f'   tab "{copied.Name}" <- {os.path.basename(path)}')
+            excel_call(lambda: src.Close(SaveChanges=False))
+        for blank in blanks:                       # the empty sheets Add() made
+            excel_call(lambda: combo.Worksheets(blank).Delete())
+        excel_call(lambda: combo.Worksheets(1).Activate())
+        excel_call(lambda: combo.SaveAs(os.path.abspath(target),
+                                        FileFormat=EXCEL_FORMATS[FILE_EXT]))
+        excel_call(lambda: combo.Close(SaveChanges=False))
+    finally:
+        try:
+            xl.Quit()
+        except pywintypes.com_error:
+            pass
+        del xl
+    wait_file_stable(target)
+    log.info(f'   saved {target}')
+
+
 def press(*keys):
     for k in keys:
         pyautogui.press(k)
@@ -483,6 +534,7 @@ def run_report(index, report, start, end, output_dir):
     qb_export()
     excel_save(target)
     log.info(f'   saved {target}')
+    return target
 
 
 # ------------------------------------------------------------------ main ---
@@ -516,8 +568,15 @@ def main():
     log.info(f'Log:    {log_path}')
     try:
         preflight()
+        combined = os.path.join(output_dir,
+                                f'{FILE_PREFIX} {file_date(end)} {COMBINED_NAME}')
+        if COMBINED_WORKBOOK:
+            remove_old_outputs(combined)   # never leave a stale combined file
+        saved = []
         for i, report in enumerate(REPORTS):
-            run_report(i, report, start, end, output_dir)
+            saved.append((report.name, run_report(i, report, start, end, output_dir)))
+        if COMBINED_WORKBOOK:
+            build_combined(saved, f'{combined}.{FILE_EXT}')
 
         # Back to the QuickBooks home page
         raise_window(QB_TITLE, what='QuickBooks')
