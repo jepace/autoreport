@@ -2,29 +2,29 @@
 '''
 autoreport2.py -- next-generation version of autoreport.py
 
-Runs the QuickBooks "Favorite Reports", exports each to Excel and saves it as
-.xlsm in an output folder.  Same keystroke-driven approach as autoreport.py
-(which is left untouched), restructured to fix the issues in CODE_ISSUES.md:
+Runs the QuickBooks "Favorite Reports", exports each to Excel, and combines
+them into ONE workbook (one tab per report) in the reports folder:
 
-* All settings live in the CONFIG section below (reports, window titles,
-  menu position, default output folder, timings).
-* Each report declares how many date fields it has and any extra tabs it
-  needs, instead of special-casing names in the code.
-* No date typing: pick a year and calendar quarter (defaults to the most
-  recently finished quarter, so normally you just press Enter).
+    Pembrook 26Q3 Quarterly Reports 261119.xlsx      (quarter, then run date)
+
+Same keystroke-driven approach as autoreport.py (which is left untouched),
+restructured to fix the issues in CODE_ISSUES.md:
+
+* All settings live in the CONFIG section below.
+* Pick the quarter from a list (defaults to the last finished one, so
+  normally you just press Enter). No date typing.
 * Refuses to start if Excel is already open, so it can never save or close
   the wrong workbook.
-* QuickBooks is driven by keystrokes, but Excel is driven directly through
-  its own automation interface (COM, via pywin32): no Save As dialog, no
-  file-type dropdown, no prompts.  Saves plain .xlsx and removes the
-  "QuickBooks Export Tips" sheet QB adds.
-* Also builds one combined workbook with every report as its own tab
-  ("Pembrook 26Q3 Quarterly Reports 261119.xlsx") and copies it up one
-  folder from the scratch output folder, never overwriting an existing file.
-* Waits for windows and for the saved file on disk, instead of fixed sleeps.
-* Every run writes a log to <output folder>/logs/.
-* Failures stop with a clear message; the console waits for Enter.
-  A failed run should be redone from the start.
+* QuickBooks is driven by keystrokes; Excel is driven directly through its
+  own automation interface (COM, via pywin32), with no dialogs or prompts.
+  Plain .xlsx, with QuickBooks' "Export Tips" sheet removed.
+* Never overwrites: if the name is taken, saves as "... v2.xlsx", etc.
+* The per-report files are made in a temporary working folder under
+  <reports folder>\\auto and deleted after a successful run, so the only
+  file you see is the combined one.  A failed run keeps them for inspection.
+* Waits for windows and files instead of fixed sleeps.
+* Every run writes a log to <reports folder>\\auto\\logs.
+* A failed run should be redone from the start.
 
 Requirements: Windows, QuickBooks Desktop, Excel, and
     pip install pyautogui wxPython pywin32
@@ -32,8 +32,8 @@ Requirements: Windows, QuickBooks Desktop, Excel, and
 Emergency stop: slam the mouse into a screen corner (pyautogui FAILSAFE).
 '''
 
+import ctypes
 import datetime as dt
-import glob
 import logging
 import os
 import shutil
@@ -57,7 +57,8 @@ class Report:
     date_fields: int = 2   # 2 = From/To, 1 = single "as of" date
     extra_tabs: int = 0    # Extra tabs needed after the last date to refresh
 
-# Order MUST match the order in QuickBooks: Reports > Favorite Reports
+# Order MUST match the order in QuickBooks: Reports > Favorite Reports.
+# The combined workbook's tabs are in this order too.
 REPORTS = [
     Report('P-L YTD Comp'),
     Report('Balance Sheet Detail'),
@@ -81,30 +82,22 @@ FILE_PREFIX = 'Pembrook'
 FILE_EXT = 'xlsx'          # 'xlsx' (plain data) or 'xlsm' (keeps QB's macros)
 EXCEL_FORMATS = {'xlsx': 51, 'xlsm': 52}   # Excel's FileFormat codes
 
+def combined_name(year, quarter, run_date):
+    '''e.g. "Pembrook 26Q3 Quarterly Reports 261119" (run date at the end).'''
+    return f'{FILE_PREFIX} {year % 100:02d}Q{quarter} Quarterly Reports {run_date:%y%m%d}'
+
 # Sheets QuickBooks adds that we don't want. Matched case-insensitively as a
 # prefix of the sheet name. Never deletes the last remaining sheet.
 # Every run logs the sheet names it saw, so check the log if this needs tweaking.
 DROP_SHEETS = ('QuickBooks Export Tips',)
 
-# Also build one workbook with every report as its own tab (tabs named after
-# the reports, in REPORTS order). The separate files are still written.
-COMBINED_WORKBOOK = True
-
-def combined_name(year, quarter, run_date):
-    # e.g. "Pembrook 26Q3 Quarterly Reports 261119" (run date at the end)
-    return f'{FILE_PREFIX} {year % 100:02d}Q{quarter} Quarterly Reports {run_date:%y%m%d}'
-
-# Copy the combined workbook from the output (scratch) folder to the real
-# folder one level up. Never overwrites: if the name is taken there, adds
-# " v2", " v3", ... The separate per-report files stay in the scratch folder.
-PUBLISH_COMBINED = True
-
-def publish_dir(output_dir):
-    return os.path.dirname(os.path.normpath(output_dir))
-
-def default_output_dir():
+def default_reports_dir():
+    '''Where the combined workbook goes (can be changed in the dialog).'''
     base = os.environ.get('OneDrive') or os.path.expanduser('~')
-    return os.path.join(base, 'Documents', 'Pembrook', 'Finance', 'Pembrook', 'auto')
+    return os.path.join(base, 'Documents', 'Pembrook', 'Finance', 'Pembrook')
+
+WORK_SUBDIR = 'auto'       # <reports folder>\auto holds logs and working files
+QUARTERS_LISTED = 8        # how many quarters the dialog offers
 
 # Timeouts (seconds). "Soft" waits log a warning and carry on if the window
 # is never seen -- they replace old fixed sleeps whose window titles haven't
@@ -125,16 +118,14 @@ class AutoReportError(Exception):
     pass
 
 
-def setup_logging(output_dir, year, quarter):
+def setup_logging(log_dir, year, quarter, stamp):
     log.setLevel(logging.DEBUG)
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.DEBUG if CONSOLE_DEBUG else logging.INFO)
     console.setFormatter(logging.Formatter('%(message)s'))
     log.addHandler(console)
 
-    log_dir = os.path.join(output_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
-    stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
     path = os.path.join(log_dir, f'autoreport {year}Q{quarter} {stamp}.log')
     fh = logging.FileHandler(path, encoding='utf-8')
     fh.setLevel(logging.DEBUG)
@@ -152,11 +143,19 @@ def quarter_range(year, quarter):
     return start, next_start - dt.timedelta(days=1)
 
 
-def last_completed_quarter(today=None):
-    '''(year, quarter) of the most recently finished calendar quarter.'''
+def previous_quarter(year, quarter):
+    return (year - 1, 4) if quarter == 1 else (year, quarter - 1)
+
+
+def recent_quarters(count, today=None):
+    '''[(year, quarter), ...] newest first, starting with the one in progress.'''
     today = today or dt.date.today()
-    q = (today.month - 1) // 3   # 0 means the last quarter was Q4 of last year
-    return (today.year - 1, 4) if q == 0 else (today.year, q)
+    yq = (today.year, (today.month - 1) // 3 + 1)
+    result = []
+    for _ in range(count):
+        result.append(yq)
+        yq = previous_quarter(*yq)
+    return result
 
 
 def fmt_date(d):
@@ -171,85 +170,148 @@ def file_date(d):
 
 # ---------------------------------------------------------------- dialog ---
 
+def enable_high_dpi():
+    '''Tell Windows we handle high-DPI screens, so text is sharp, not stretched.'''
+    if sys.platform != 'win32':
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor (Win 8.1+)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()    # older fallback
+        except (AttributeError, OSError):
+            pass
+
+
 class InputDialog(wx.Dialog):
-    def __init__(self):
-        super().__init__(None, title='QuickBooks Quarterly Reports',
-                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.year = self.quarter = self.output_dir = None
-        year, quarter = last_completed_quarter()
+    '''Asks which quarter to run and where the combined workbook goes.
 
-        self.year_ctrl = wx.SpinCtrl(self, min=2000, max=2100, initial=year)
-        self.quarter_ctrl = wx.RadioBox(self, choices=['Q1', 'Q2', 'Q3', 'Q4'],
-                                        majorDimension=4, style=wx.RA_SPECIFY_COLS)
-        self.quarter_ctrl.SetSelection(quarter - 1)
-        self.dir_ctrl = wx.DirPickerCtrl(self, path=default_output_dir(),
-                                         style=wx.DIRP_USE_TEXTCTRL)
-        self.range_lbl = wx.StaticText(self)
-        self.year_ctrl.Bind(wx.EVT_SPINCTRL, self.update_range)
-        self.year_ctrl.Bind(wx.EVT_TEXT, self.update_range)
-        self.quarter_ctrl.Bind(wx.EVT_RADIOBOX, self.update_range)
-        self.update_range()
+    After ShowModal() returns wx.ID_OK, self.result is
+    (year, quarter, reports_dir); otherwise it is None.'''
 
-        grid = wx.FlexGridSizer(cols=2, vgap=10, hgap=10)
-        grid.AddGrowableCol(1)
-        for label, ctrl in (('Year', self.year_ctrl),
-                            ('Quarter', self.quarter_ctrl),
-                            ('Range', self.range_lbl),
-                            ('Output Folder', self.dir_ctrl)):
-            grid.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
-            grid.Add(ctrl, 1, wx.EXPAND)
+    def __init__(self, reports_dir, today=None):
+        super().__init__(None, title='Quarterly Reports')
+        self.today = today or dt.date.today()
+        self.reports_dir = reports_dir
+        self.quarters = recent_quarters(QUARTERS_LISTED, self.today)
+        self.result = None
 
-        start_btn = wx.Button(self, wx.ID_OK, 'Start')
-        quit_btn = wx.Button(self, wx.ID_CANCEL, 'Quit')
-        buttons = wx.StdDialogButtonSizer()
-        buttons.AddButton(start_btn)
-        buttons.AddButton(quit_btn)
-        buttons.Realize()
-
-        main = wx.BoxSizer(wx.VERTICAL)
-        main.Add(grid, 0, wx.EXPAND | wx.ALL, 15)
-        main.Add(buttons, 0, wx.EXPAND | wx.ALL, 15)
-        self.SetSizerAndFit(main)
-        self.SetSize((max(self.GetSize()[0], 520), -1))
-
-        start_btn.SetDefault()
-        start_btn.Bind(wx.EVT_BUTTON, self.on_start)
+        self._build()
+        self._update_preview()
         self.Centre()
-        start_btn.SetFocus()   # defaults are usually right: just press Enter
 
-    def selection(self):
-        return self.year_ctrl.GetValue(), self.quarter_ctrl.GetSelection() + 1
+    # -- layout --
 
-    def update_range(self, event=None):
-        start, end = quarter_range(*self.selection())
-        self.range_lbl.SetLabel(f'{fmt_date(start)}  -  {fmt_date(end)}')
-        if event:
-            event.Skip()
+    def _build(self):
+        gap = self.FromDIP(8)
+        margin = self.FromDIP(20)
 
-    def on_start(self, event):
-        year, quarter = self.selection()
+        title = wx.StaticText(self, label='QuickBooks Quarterly Reports')
+        title.SetFont(title.GetFont().Scaled(1.4).Bold())
+
+        self.quarter_choice = wx.Choice(self, choices=[self._quarter_label(*yq)
+                                                       for yq in self.quarters])
+        self.quarter_choice.SetSelection(1)   # [0] is in progress; [1] last finished
+        self.quarter_choice.Bind(wx.EVT_CHOICE, self._update_preview)
+
+        self.file_text = wx.StaticText(self)
+        self.file_text.SetFont(self.file_text.GetFont().Bold())
+        self.dir_text = wx.StaticText(self, style=wx.ST_ELLIPSIZE_MIDDLE)
+        change = wx.Button(self, label='Change…')
+        change.Bind(wx.EVT_BUTTON, self._on_change_dir)
+
+        dir_row = wx.BoxSizer(wx.HORIZONTAL)
+        dir_row.Add(self.dir_text, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, gap)
+        dir_row.Add(change, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        form = wx.FlexGridSizer(cols=2, vgap=gap, hgap=self.FromDIP(12))
+        form.AddGrowableCol(1)
+        for label, item in (('Quarter', self.quarter_choice),
+                            ('Creates', self.file_text),
+                            ('In', dir_row)):
+            form.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            form.Add(item, 1, wx.EXPAND | wx.ALIGN_CENTER_VERTICAL)
+
+        notice = self._notice('Close Excel first. Don\'t touch the keyboard or mouse '
+                              'while it runs. To stop it, move the mouse into a '
+                              'corner of the screen.')
+
+        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
+        self.FindWindow(wx.ID_OK).SetLabel('Start')
+        self.FindWindow(wx.ID_CANCEL).SetLabel('Quit')
+        self.Bind(wx.EVT_BUTTON, self._on_start, id=wx.ID_OK)
+
+        body = wx.BoxSizer(wx.VERTICAL)
+        body.Add(title, 0, wx.BOTTOM, margin)
+        body.Add(form, 0, wx.EXPAND | wx.BOTTOM, margin)
+        body.Add(notice, 0, wx.EXPAND | wx.BOTTOM, margin)
+        body.Add(buttons, 0, wx.ALIGN_RIGHT)
+
+        outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(body, 1, wx.EXPAND | wx.ALL, margin)
+        outer.SetMinSize(self.FromDIP(wx.Size(560, -1)))
+        self.SetSizerAndFit(outer)
+        self.FindWindow(wx.ID_OK).SetFocus()   # Enter = Start
+
+    def _notice(self, message):
+        '''An info icon beside wrapped text.'''
+        icon = wx.StaticBitmap(self, bitmap=wx.ArtProvider.GetBitmap(
+            wx.ART_INFORMATION, wx.ART_MESSAGE_BOX, self.FromDIP(wx.Size(20, 20))))
+        text = wx.StaticText(self, label=message)
+        text.Wrap(self.FromDIP(470))
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(icon, 0, wx.RIGHT, self.FromDIP(10))
+        row.Add(text, 1)
+        return row
+
+    # -- behaviour --
+
+    def _quarter_label(self, year, quarter):
+        start, end = quarter_range(year, quarter)
+        label = f'{year} Q{quarter}   ({start:%b} {start.day} – {end:%b} {end.day})'
+        return label + '   — in progress' if end >= self.today else label
+
+    def _selected(self):
+        return self.quarters[self.quarter_choice.GetSelection()]
+
+    def _update_preview(self, event=None):
+        self.file_text.SetLabel(f'{combined_name(*self._selected(), self.today)}.{FILE_EXT}')
+        self.dir_text.SetLabel(self.reports_dir)
+        self.dir_text.SetToolTip(self.reports_dir)
+        self.Layout()
+
+    def _on_change_dir(self, event):
+        with wx.DirDialog(self, 'Where should the combined workbook go?',
+                          defaultPath=self.reports_dir,
+                          style=wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                self.reports_dir = dlg.GetPath()
+                self._update_preview()
+
+    def _on_start(self, event):
+        year, quarter = self._selected()
         _, end = quarter_range(year, quarter)
-        out = self.dir_ctrl.GetPath().strip()
-        if end >= dt.date.today():
-            ok = wx.MessageBox(f'{fmt_date(end)} has not passed yet. Run anyway?',
-                               'Quarter not finished', wx.YES_NO | wx.ICON_QUESTION, self)
-            if ok != wx.YES:
-                return
-        if not out:
-            return wx.MessageBox('Choose an output folder.', 'Invalid input',
-                                 wx.OK | wx.ICON_ERROR, self)
-        self.year, self.quarter, self.output_dir = year, quarter, out
+        if end >= self.today and wx.MessageBox(
+                f'{year} Q{quarter} isn\'t over until {fmt_date(end)}. Run anyway?',
+                'Quarter in progress', wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
+                self) != wx.YES:
+            return
+        if not os.path.isdir(self.reports_dir):
+            wx.MessageBox(f'Folder not found:\n{self.reports_dir}', 'Folder not found',
+                          wx.OK | wx.ICON_ERROR, self)
+            return
+        self.result = (year, quarter, self.reports_dir)
         self.EndModal(wx.ID_OK)
 
 
 def get_input():
-    '''Returns (year, quarter, output_dir) or None if the user quit.'''
-    app = wx.App(False)  # noqa: F841  (must stay alive while dialog runs)
-    dlg = InputDialog()
+    '''Show the dialog. Returns (year, quarter, reports_dir), or None if the user quit.'''
+    enable_high_dpi()
+    app = wx.App(False)  # noqa: F841  (must exist while the dialog runs)
+    dlg = InputDialog(default_reports_dir())
     try:
-        if dlg.ShowModal() != wx.ID_OK:
-            return None
-        return dlg.year, dlg.quarter, dlg.output_dir
+        dlg.ShowModal()
+        return dlg.result
     finally:
         dlg.Destroy()
 
@@ -331,6 +393,19 @@ def qb_report_is_open(name):
     return bool(found)
 
 
+def press(*keys):
+    for k in keys:
+        pyautogui.press(k)
+    log.debug('   keys: ' + ' '.join(keys))
+
+
+def hotkey(*keys):
+    pyautogui.hotkey(*keys)
+    log.debug('   keys: ' + '+'.join(keys))
+
+
+# ----------------------------------------------------------------- files ---
+
 def wait_file_stable(path, timeout=60, settle=2.0):
     '''Wait until path exists and its size stays unchanged for `settle` seconds.'''
     deadline = time.time() + timeout
@@ -345,6 +420,24 @@ def wait_file_stable(path, timeout=60, settle=2.0):
                 last_size, stable_since = size, time.time()
         time.sleep(0.5)
     raise AutoReportError(f'Saved file never appeared/settled: {path}')
+
+
+def publish(src, dest_dir):
+    '''Copy src into dest_dir without ever overwriting. Returns the new path.'''
+    stem, ext = os.path.splitext(os.path.basename(src))
+    n = 1
+    while True:
+        name = f'{stem}{ext}' if n == 1 else f'{stem} v{n}{ext}'
+        dest = os.path.join(dest_dir, name)
+        try:
+            with open(src, 'rb') as fin, open(dest, 'xb') as fout:  # 'x' fails if it exists
+                shutil.copyfileobj(fin, fout)
+        except FileExistsError:
+            log.debug(f'   {name} already exists in {dest_dir}')
+            n += 1
+            continue
+        shutil.copystat(src, dest)
+        return dest
 
 
 # ----------------------------------------------------------------- excel ---
@@ -434,30 +527,12 @@ def sheet_name(text):
     return text[:31]
 
 
-def publish(src, dest_dir):
-    '''Copy src into dest_dir without ever overwriting. Returns the new path.'''
-    stem, ext = os.path.splitext(os.path.basename(src))
-    n = 1
-    while True:
-        name = f'{stem}{ext}' if n == 1 else f'{stem} v{n}{ext}'
-        dest = os.path.join(dest_dir, name)
-        try:
-            with open(src, 'rb') as fin, open(dest, 'xb') as fout:  # 'x' fails if it exists
-                shutil.copyfileobj(fin, fout)
-        except FileExistsError:
-            log.debug(f'   {name} already exists in {dest_dir}')
-            n += 1
-            continue
-        shutil.copystat(src, dest)
-        return dest
-
-
 def build_combined(saved, target):
     '''Copy the sheets of each saved report into one workbook, one tab per report.
 
     saved: list of (report name, file path), in tab order.
     Uses its own hidden Excel instance and always quits it.'''
-    log.info(f'Combining {len(saved)} reports into {target}')
+    log.info(f'Combining {len(saved)} reports')
     xl = win32com.client.DispatchEx('Excel.Application')
     try:
         xl.Visible = False
@@ -487,33 +562,9 @@ def build_combined(saved, target):
             pass
         del xl
     wait_file_stable(target)
-    log.info(f'   saved {target}')
-
-
-def press(*keys):
-    for k in keys:
-        pyautogui.press(k)
-    log.debug('   keys: ' + ' '.join(keys))
-
-
-def hotkey(*keys):
-    pyautogui.hotkey(*keys)
-    log.debug('   keys: ' + '+'.join(keys))
 
 
 # ------------------------------------------------------------- the steps ---
-
-def remove_old_outputs(base):
-    '''Delete earlier outputs so a stale file can't be mistaken for success.'''
-    for ext in ('xlsx', 'xlsm'):
-        old = f'{base}.{ext}'
-        if os.path.isfile(old):
-            try:
-                os.remove(old)
-                log.debug(f'   removed old {old}')
-            except PermissionError:
-                raise AutoReportError(f'Cannot delete {old} -- is it open somewhere?')
-
 
 def qb_open_report(index, report, start, end):
     '''Step 1: open the report from Favorites and enter the dates.'''
@@ -558,15 +609,14 @@ def excel_save(target):
     wait_closed(is_excel_title, 30, 'Excel')   # soft: next report can still proceed
 
 
-def run_report(index, report, start, end, output_dir):
+def run_report(index, report, start, end, work_dir):
+    '''Produce one report's workbook in work_dir; returns its path.'''
     log.info(f'[{index + 1}/{len(REPORTS)}] {report.name}')
-    base = os.path.join(output_dir, f'{FILE_PREFIX} {file_date(end)} {report.name}')
-    target = f'{base}.{FILE_EXT}'
-    remove_old_outputs(base)
+    target = os.path.join(work_dir, f'{FILE_PREFIX} {file_date(end)} {report.name}.{FILE_EXT}')
     qb_open_report(index, report, start, end)
     qb_export()
     excel_save(target)
-    log.info(f'   saved {target}')
+    log.debug(f'   saved {target}')
     return target
 
 
@@ -586,55 +636,56 @@ def preflight():
         raise AutoReportError(f'QuickBooks is not running (no window matching "{QB_TITLE}")')
 
 
+def run(year, quarter, reports_dir, work_dir):
+    '''Make every report, combine them, and publish. Returns the published path.'''
+    start, end = quarter_range(year, quarter)
+    preflight()
+    saved = [(report.name, run_report(i, report, start, end, work_dir))
+             for i, report in enumerate(REPORTS)]
+    combined = os.path.join(work_dir,
+                            f'{combined_name(year, quarter, dt.date.today())}.{FILE_EXT}')
+    build_combined(saved, combined)
+    published = publish(combined, reports_dir)
+
+    # Back to the QuickBooks home page
+    raise_window(QB_TITLE, what='QuickBooks')
+    press('esc')
+    hotkey('alt', 'c')
+    press('enter')
+    return published
+
+
 def main():
-    user = get_input()
-    if user is None:
+    choice = get_input()
+    if choice is None:
         print('Cancelled.')
         return 0
-    year, quarter, output_dir = user
+    year, quarter, reports_dir = choice
+    stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+    auto_dir = os.path.join(reports_dir, WORK_SUBDIR)
+    work_dir = os.path.join(auto_dir, f'working {year}Q{quarter} {stamp}')
+    os.makedirs(work_dir)
+    log_path = setup_logging(os.path.join(auto_dir, 'logs'), year, quarter, stamp)
+
     start, end = quarter_range(year, quarter)
-    os.makedirs(output_dir, exist_ok=True)
-    log_path = setup_logging(output_dir, year, quarter)
-
     log.info(f'{year} Q{quarter}: {fmt_date(start)} - {fmt_date(end)}')
-    log.info(f'Output: {output_dir}')
-    log.info(f'Log:    {log_path}')
+    log.info(f'Reports folder: {reports_dir}')
+    log.info(f'Log: {log_path}')
     try:
-        preflight()
-        combined = os.path.join(output_dir,
-                                f'{combined_name(year, quarter, dt.date.today())}.{FILE_EXT}')
-        if COMBINED_WORKBOOK:
-            # Clear this quarter's old combined files from the scratch folder
-            # only (any run date). The publish folder is never touched.
-            stem = combined_name(year, quarter, dt.date.today())[:-len('YYMMDD')]
-            for old in glob.glob(glob.escape(os.path.join(output_dir, stem)) + '*.xls[xm]'):
-                remove_old_outputs(os.path.splitext(old)[0])
-        saved = []
-        for i, report in enumerate(REPORTS):
-            saved.append((report.name, run_report(i, report, start, end, output_dir)))
-        if COMBINED_WORKBOOK:
-            build_combined(saved, combined)
-            if PUBLISH_COMBINED:
-                dest = publish(combined, publish_dir(output_dir))
-                log.info(f'Published {dest}')
-
-        # Back to the QuickBooks home page
-        raise_window(QB_TITLE, what='QuickBooks')
-        press('esc')
-        hotkey('alt', 'c')
-        press('enter')
+        published = run(year, quarter, reports_dir, work_dir)
     except AutoReportError as e:
         log.error(f'** ERROR: {e}')
-        log.error('Run stopped. Redo the whole run once the problem is fixed.')
-        return 1
     except pyautogui.FailSafeException:
         log.error('** Stopped by user (mouse moved to screen corner).')
-        return 1
     except Exception:
         log.exception('** Unexpected error')
-        return 1
-    log.info('REPORTS GENERATED SUCCESSFULLY')
-    return 0
+    else:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        log.info(f'\nDONE: {published}')
+        return 0
+    log.error(f'Run stopped. Working files kept in: {work_dir}')
+    log.error('Redo the whole run once the problem is fixed.')
+    return 1
 
 
 if __name__ == '__main__':

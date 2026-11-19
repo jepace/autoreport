@@ -14,32 +14,27 @@ There are two scripts:
 
 ### What it does
 
-1. Asks for the **year and calendar quarter** (it defaults to the most
-   recently finished quarter, so normally you just press Enter) and the output
-   folder.
-2. For each report in QuickBooks' **Favorite Reports** menu:
-   * opens it, enters the quarter's dates, and sends it to Excel;
-   * removes the "QuickBooks Export Tips" sheet;
-   * saves it as `Pembrook YYMMDD <report name>.xlsx`, then closes Excel.
-3. Builds one combined workbook with every report as its own tab, named
-   `Pembrook YYQN Quarterly Reports YYMMDD.xlsx`, e.g.
-   `Pembrook 26Q3 Quarterly Reports 261119.xlsx`.
-4. **Publishes** that combined workbook: copies it from the output folder
-   (`auto`, treated as scratch) up one level to where the real files live.
-5. Returns QuickBooks to its home page.
+You get **one file**: a workbook with every report on its own tab, named
+`Pembrook YYQN Quarterly Reports YYMMDD.xlsx` (quarter, then the date you ran
+it), e.g. `Pembrook 26Q3 Quarterly Reports 261119.xlsx`.
 
-In the separate report files, `YYMMDD` is the last day of the quarter (e.g.
-`260930`). In the combined workbook it is the date of the run.
+1. Asks which **quarter** to run (it defaults to the last finished one, so
+   normally you just press Enter) and shows the exact file it will create.
+2. For each report in QuickBooks' **Favorite Reports** menu: opens it, enters
+   the quarter's dates, sends it to Excel, removes the "QuickBooks Export
+   Tips" sheet, and saves it to a temporary working folder.
+3. Combines them into the one workbook and saves it to the reports folder.
+4. Deletes the working folder and returns QuickBooks to its home page.
 
 ### Files and folders
 
-| Where | What | Overwritten on rerun? |
-|---|---|---|
-| `auto\` (output folder) | The 5 separate report files, plus the combined workbook | Yes. It's scratch: each run deletes that quarter's old files first |
-| One level up from `auto\` | The published combined workbook | **Never.** If the name is taken, the copy is saved as `... v2.xlsx`, `... v3.xlsx`, etc. |
+| Where | What |
+|---|---|
+| Reports folder (default `OneDrive\Documents\Pembrook\Finance\Pembrook`) | The combined workbook. **Never overwritten:** if the name is taken (e.g. a second run the same day), it is saved as `... v2.xlsx`, `... v3.xlsx`, etc. |
+| `<reports folder>\auto\logs\` | A log of every run |
+| `<reports folder>\auto\working ...\` | Temporary per-report files. Deleted after a successful run; **kept after a failed one** so you can see how far it got |
 
-So rerunning a quarter can never overwrite a file in the real folder. Delete
-any extra `v2`/`v3` copies you don't want.
+Nothing is put in the reports folder unless every report succeeded.
 
 QuickBooks is driven with keystrokes. Excel is controlled directly through its
 own automation interface, so there's no Save As dialog and no pop-ups.
@@ -68,16 +63,17 @@ to match the `REPORTS` list at the top of `autoreport2.py`.
 1. Open QuickBooks. **Close Excel**: the script refuses to start if Excel is
    open, so it can't save or close the wrong workbook.
 2. Run `python autoreport2.py`.
-3. Check the quarter and folder, then press **Start**.
+3. Check the quarter and the file name it shows, then press **Start** (or
+   Enter). Use **Change…** to put the file somewhere else.
 4. Don't touch the keyboard or mouse until it finishes. **To stop it in an
    emergency, move the mouse hard into a corner of the screen.**
 
-If a run fails, fix the problem and **redo the whole run**. Nothing is
-published unless every report succeeded.
+If a run fails, fix the problem and **redo the whole run**. You can delete
+the leftover `working ...` folder once you've looked at it.
 
 ### Log files
 
-Every run writes a log to `<output folder>\logs\`, named like
+Every run writes a log to `<reports folder>\auto\logs\`, named like
 `autoreport 2026Q3 20261119-191736.log`. It records each keystroke, each
 window it waited for, the sheet names in each workbook, and every file saved.
 Check it first if something goes wrong.
@@ -98,9 +94,10 @@ All settings are at the top of `autoreport2.py`:
 | `FILE_PREFIX` | First word of each file name |
 | `FILE_EXT` | `'xlsx'` (plain data) or `'xlsm'` (keeps QuickBooks' macros) |
 | `DROP_SHEETS` | Sheet names to delete from each export |
-| `COMBINED_WORKBOOK`, `combined_name()` | Whether to build the combined workbook, and its name |
-| `PUBLISH_COMBINED`, `publish_dir()` | Whether to copy it to the real folder, and where (default: one level up from the output folder) |
-| `default_output_dir()` | Default output folder (under OneDrive) |
+| `combined_name()` | Name of the combined workbook |
+| `default_reports_dir()` | Default reports folder (under OneDrive) |
+| `WORK_SUBDIR` | Subfolder for logs and working files (`auto`) |
+| `QUARTERS_LISTED` | How many quarters the dialog offers (8) |
 | `*_TIMEOUT` | How long to wait for each window |
 | `pyautogui.PAUSE` | Delay between keystrokes (0.3 s; 0.1 is too fast for QuickBooks) |
 | `CONSOLE_DEBUG` | Step-by-step detail in the console (the log always has it) |
