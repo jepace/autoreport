@@ -807,7 +807,7 @@ def qb_export():
                               '(twice). Stopped so no keys land in the report.')
     before = qb_dialogs()
     press('n')                                 # "Create New Worksheet"
-    dialog = wait_until(lambda: new_qb_windows(before, menus=False), 5,
+    dialog = wait_until(lambda: new_qb_windows(before, menus=False), 1,
                         '"Send Report to Excel" dialog', soft=True, minimum=2)
     if dialog:   # diagnostics: confirms what the dialog looks like
         log.debug('   dialog: ' + ' | '.join(dialog.values()))

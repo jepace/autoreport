@@ -21,9 +21,12 @@ it), e.g. `Pembrook 26Q3 Quarterly Reports 261119.xlsx`.
 1. Asks which **quarter** to run (it defaults to the last finished one, so
    normally you just press Enter) and shows the exact file it will create.
 2. For each report in QuickBooks' **Favorite Reports** menu: opens it, enters
-   the quarter's dates, sends it to Excel, removes the "QuickBooks Export
-   Tips" sheet, and saves it to a temporary working folder.
-3. Combines them into the one workbook and saves it to the reports folder.
+   the quarter's dates, sends it to Excel, checks the dates in the report's
+   header, removes the "QuickBooks Desktop Export Tips" sheet, and saves it to
+   a temporary working folder.
+3. Combines them into the one workbook (tabs named after the titles
+   QuickBooks prints, e.g. *Summary Balance Sheet*) and saves it to the
+   reports folder.
 4. Deletes the working folder and returns QuickBooks to its home page.
 
 ### Files and folders
@@ -68,9 +71,10 @@ to match the `REPORTS` list at the top of `autoreport2.py`.
 4. Don't touch the keyboard or mouse until it finishes. **To stop it in an
    emergency, move the mouse hard into a corner of the screen.**
 
-If a run fails, fix the problem and **redo the whole run**. You can delete
-the leftover working folder (its path is at the end of the log) once you've
-looked at it.
+If a run fails, fix the problem and **redo the whole run**. Close any Excel
+window it left open first (the script will remind you). You can delete the
+leftover working folder (its path is at the end of the log) once you've looked
+at it.
 
 ### Log files
 
@@ -81,8 +85,9 @@ Check it first if something goes wrong.
 
 Two things in the log deserve attention:
 
-* `** <report>: page header does not show ... -- CHECK THE DATES`
-  means the exported report may have the wrong date range. Open it and check.
+* `** <report>: expected "..." in the page header -- CHECK THE DATES`
+  means the exported report may have the wrong date range. Open that tab and
+  check before sending it.
 * `The "<title>" report window never appeared` stops the run. Either the wrong
   report opened (check the Favorites order), or the report's `title` in
   `REPORTS` doesn't match. The log lists the visible QuickBooks windows just
@@ -111,6 +116,19 @@ All settings are at the top of `autoreport2.py`:
 ### Known limits
 
 * Reports are chosen by menu position, so reordering Favorites or a QuickBooks
-  update that changes the Reports menu will pick the wrong report.
+  update that changes the Reports menu will pick the wrong report. The
+  script notices (the report window it expects never appears) and stops.
 * QuickBooks itself is still driven by keystrokes, so leave the PC alone
   while it runs.
+
+### If it breaks after a QuickBooks or Excel update
+
+The script stops rather than guessing, and the log says where. The usual
+suspects, all in the settings at the top of `autoreport2.py`:
+
+| Log says | Likely fix |
+|---|---|
+| `report window never appeared` | Favorites order changed, or QuickBooks renamed the report: update `REPORTS` (the log lists the window titles it saw) |
+| `did not open the Excel menu` | QuickBooks was slow or the toolbar changed; try once more, then check Alt+X still opens the report's Excel button menu |
+| `QuickBooks is not running` | The main window title changed: update `QB_TITLE` |
+| `did not finish exporting` | The tips sheet was renamed or turned off: update `EXPORT_TIPS_SHEET` |
