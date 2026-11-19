@@ -78,9 +78,14 @@ Every run writes a log to `<reports folder>\auto\logs\`, named like
 window it waited for, the sheet names in each workbook, and every file saved.
 Check it first if something goes wrong.
 
-Warnings like `did not see QB report window ... -- continuing` mean a window
-title in the settings doesn't match what QuickBooks shows. The run still
-works, just more slowly. Correct the title in the settings to fix it.
+Two things in the log deserve attention:
+
+* `** <report>: quarter end ... not found in report header -- CHECK THE DATES`
+  means the exported report may have the wrong date range. Open it and check.
+* `The "<title>" report window never appeared` stops the run. Either the wrong
+  report opened (check the Favorites order), or the report's `title` in
+  `REPORTS` doesn't match. The log lists the visible QuickBooks windows just
+  above, so you can copy the right title from there.
 
 ### Settings
 
@@ -88,12 +93,12 @@ All settings are at the top of `autoreport2.py`:
 
 | Setting | What it controls |
 |---|---|
-| `REPORTS` | Reports in Favorites order; how many date fields each has (`date_fields`); extra tabs needed to refresh (`extra_tabs`) |
-| `QB_TITLE`, `EXPORT_DIALOG_TITLE` | Window titles the script looks for |
+| `REPORTS` | Reports in Favorites order: the Favorites name (also the tab name), the title QuickBooks gives the report's window, how many date fields it has (`date_fields`), and extra tabs needed to refresh (`extra_tabs`) |
+| `QB_TITLE` | Part of the main QuickBooks window title |
 | `FAVORITES_MENU_DOWNS` | How far down the Reports menu "Favorite Reports" is |
 | `FILE_PREFIX` | First word of each file name |
 | `FILE_EXT` | `'xlsx'` (plain data) or `'xlsm'` (keeps QuickBooks' macros) |
-| `DROP_SHEETS` | Sheet names to delete from each export |
+| `EXPORT_TIPS_SHEET` | The tips sheet QuickBooks adds when it *finishes* exporting. The script waits for it, then deletes it |
 | `combined_name()` | Name of the combined workbook |
 | `default_reports_dir()` | Default reports folder (under OneDrive) |
 | `WORK_SUBDIR` | Subfolder for logs and working files (`auto`) |

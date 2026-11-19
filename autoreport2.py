@@ -53,22 +53,22 @@ import wx
 
 @dataclass
 class Report:
-    name: str              # Must match the name in QB's Favorite Reports, in order
+    name: str              # Name in QB's Favorite Reports (also the tab name)
+    title: str             # Title QB gives the report's window (see the log)
     date_fields: int = 2   # 2 = From/To, 1 = single "as of" date
     extra_tabs: int = 0    # Extra tabs needed after the last date to refresh
 
 # Order MUST match the order in QuickBooks: Reports > Favorite Reports.
 # The combined workbook's tabs are in this order too.
 REPORTS = [
-    Report('P-L YTD Comp'),
-    Report('Balance Sheet Detail'),
-    Report('Balance Sheet Summary', date_fields=1),
-    Report('AP Aging Detail', date_fields=1, extra_tabs=2),
-    Report('Transaction Detail by acct'),
+    Report('P-L YTD Comp', 'Profit & Loss YTD Comparison'),
+    Report('Balance Sheet Detail', 'Balance Sheet Detail'),   # title not yet confirmed
+    Report('Balance Sheet Summary', 'Summary Balance Sheet', date_fields=1),
+    Report('AP Aging Detail', 'A/P Aging Detail', date_fields=1, extra_tabs=2),
+    Report('Transaction Detail by acct', 'Transaction Detail by Account'),
 ]
 
 QB_TITLE = 'QuickBooks Desktop Pro 2020'   # substring of the main QB window title
-EXPORT_DIALOG_TITLE = 'Send Report to Excel'
 
 def is_excel_title(title):
     # Excel windows are titled "<workbook> - Excel". Matching the ending
@@ -86,10 +86,10 @@ def combined_name(year, quarter, run_date):
     '''e.g. "Pembrook 26Q3 Quarterly Reports 261119" (run date at the end).'''
     return f'{FILE_PREFIX} {year % 100:02d}Q{quarter} Quarterly Reports {run_date:%y%m%d}'
 
-# Sheets QuickBooks adds that we don't want. Matched case-insensitively as a
-# prefix of the sheet name. Never deletes the last remaining sheet.
-# Every run logs the sheet names it saw, so check the log if this needs tweaking.
-DROP_SHEETS = ('QuickBooks Export Tips',)
+# QuickBooks adds a "QuickBooks Desktop Export Tips" sheet when it FINISHES
+# exporting, so its appearance is the signal that the export is complete.
+# It is then deleted. Matched case-insensitively anywhere in the sheet name.
+EXPORT_TIPS_SHEET = 'Export Tips'
 
 def default_reports_dir():
     '''Where the combined workbook goes (can be changed in the dialog).'''
@@ -99,15 +99,10 @@ def default_reports_dir():
 WORK_SUBDIR = 'auto'       # <reports folder>\auto holds logs and working files
 QUARTERS_LISTED = 8        # how many quarters the dialog offers
 
-# Waits (seconds). Each QB step always waits at least the *_MIN time (the
-# original script's proven fixed sleeps), then up to *_TIMEOUT more for the
-# expected window. If the window is never seen, the log lists the window
-# titles that WERE open, so the expected title can be corrected.
-QB_REPORT_MIN = 2          # report opens and finishes building
-QB_REPORT_TIMEOUT = 6
-EXPORT_DIALOG_MIN = 2      # "Send Report to Excel" dialog
-EXPORT_DIALOG_TIMEOUT = 4
-EXCEL_START_TIMEOUT = 300  # Excel can be slow to start
+# Waits (seconds).
+QB_REPORT_TIMEOUT = 60     # for the report window to appear (big reports are slow)
+QB_REPORT_SETTLE = 1.5     # extra pause after it appears, before typing dates
+EXPORT_TIMEOUT = 900       # for QB to finish exporting to Excel (big reports: minutes)
 
 pyautogui.PAUSE = 0.3      # 0.1 is too fast for QB; 0.3 works
 CONSOLE_DEBUG = True       # show step-by-step detail in the console (log always has it)
@@ -373,22 +368,10 @@ def wait_until(condition, timeout, what, soft=False, minimum=0, on_miss=None):
         time.sleep(0.2)
 
 
-def log_window_titles(qb_children=False):
-    '''Diagnostics: log the titles of open windows (and QB's inner windows).'''
-    titles = sorted({w.title for w in pyautogui.getAllWindows() if w.title.strip()})
-    log.warning('   open windows: ' + ' | '.join(titles))
-    qb = find_window(QB_TITLE) if qb_children else None
-    if qb:
-        inner = []
-        def collect(hwnd, _):
-            text = win32gui.GetWindowText(hwnd).strip()
-            if text and text not in inner:
-                inner.append(text)
-        try:
-            win32gui.EnumChildWindows(qb._hWnd, collect, None)
-        except Exception:
-            pass
-        log.warning('   QuickBooks inner windows: ' + ' | '.join(inner[:40]))
+def log_qb_windows():
+    '''Diagnostics: log the visible windows inside QuickBooks.'''
+    titles = list(dict.fromkeys(text for _, text in qb_inner_windows()))
+    log.warning('   visible QuickBooks windows: ' + ' | '.join(titles[:40]))
 
 
 def raise_window(match, timeout=30, what=None):
@@ -410,24 +393,32 @@ def wait_closed(match, timeout, what):
     return wait_until(lambda: not find_windows(match), timeout, f'{what} to close', soft=True)
 
 
-def qb_report_is_open(name):
-    '''True if a QB report window titled with `name` exists, either as a
-    child window inside QuickBooks or as a separate top-level window.'''
-    needle = name.lower()
-    if find_window(lambda t: needle in t.lower() and not is_excel_title(t)):
-        return True
+def qb_inner_windows(visible_only=True):
+    '''[(hwnd, title)] of the windows inside QuickBooks.
+
+    QB keeps closed forms around as hidden windows, so by default only
+    visible ones count -- otherwise a stale window can look like the report.'''
     qb = find_window(QB_TITLE)
     if not qb:
-        return False
+        return []
     found = []
-    def check(hwnd, _):
-        if needle in win32gui.GetWindowText(hwnd).lower():
-            found.append(hwnd)
+    def collect(hwnd, _):
+        text = win32gui.GetWindowText(hwnd).strip()
+        if text and (not visible_only or win32gui.IsWindowVisible(hwnd)):
+            found.append((hwnd, text))
     try:
-        win32gui.EnumChildWindows(qb._hWnd, check, None)
+        win32gui.EnumChildWindows(qb._hWnd, collect, None)
     except Exception:
         pass
-    return bool(found)
+    return found
+
+
+def qb_report_window(title):
+    '''hwnd of the visible QB report window with exactly this title, or None.'''
+    for hwnd, text in qb_inner_windows():
+        if text.lower() == title.lower():
+            return hwnd
+    return None
 
 
 def press(*keys):
@@ -519,7 +510,8 @@ def _export_snapshot():
             return None
         wb = xl.Workbooks(count)
         sheets = wb.Worksheets
-        state = (xl.Ready, wb.FullName, sheets.Count,
+        names = tuple(sheets(i).Name for i in range(1, sheets.Count + 1))
+        state = (xl.Ready, wb.FullName, names,
                  tuple(sheets(i).UsedRange.Address for i in range(1, sheets.Count + 1)))
         return xl, wb, state
     except pywintypes.com_error as e:
@@ -527,45 +519,96 @@ def _export_snapshot():
         return None
 
 
+def is_tips_sheet(name):
+    return EXPORT_TIPS_SHEET.lower() in name.lower()
+
+
+def qb_busy():
+    '''True while QuickBooks is showing a modal window (e.g. export progress).'''
+    qb = find_window(QB_TITLE)
+    try:
+        return bool(qb) and not win32gui.IsWindowEnabled(qb._hWnd)
+    except Exception:
+        return False
+
+
 def wait_for_export_workbook(timeout, settle=3.0):
-    '''Wait for the workbook QuickBooks creates, and for QB to finish filling it
-    (Excel ready and nothing changing for `settle` seconds).'''
+    '''Wait for the workbook QuickBooks creates, and for QB to FINISH filling it.
+
+    Done means: QB has added its Export Tips sheet (it does that last), QB is
+    no longer busy, Excel is ready, and nothing has changed for `settle` s.
+    Quiet alone isn't enough: on big reports QB can go quiet for a long time
+    mid-export.'''
     start = time.time()
-    last_state, since, seen = None, None, False
+    last_state, since, seen, last_note = None, None, False, 0
     while time.time() - start < timeout:
         snap = _export_snapshot()
         if snap is None:
             last_state = None                  # gone or busy: start settling over
         else:
             xl, wb, state = snap
+            ready, _, names, _ = state
             if not seen:
                 log.debug(f'   Excel workbook appeared ({time.time() - start:.1f}s)')
                 seen = True
+            finished = any(is_tips_sheet(n) for n in names) and not qb_busy()
             if state != last_state:
                 last_state, since = state, time.time()
-            elif state[0] and time.time() - since >= settle:
-                log.debug(f'   workbook ready: {state[1]} ({time.time() - start:.1f}s)')
+            elif ready and finished and time.time() - since >= settle:
+                log.debug(f'   export finished: {list(names)} ({time.time() - start:.1f}s)')
                 return xl, wb
+            if time.time() - last_note > 30:   # reassurance on long exports
+                log.info(f'   waiting for QuickBooks to finish exporting '
+                         f'({time.time() - start:.0f}s)...')
+                last_note = time.time()
         time.sleep(0.5)
-    raise AutoReportError('Excel workbook from QuickBooks '
-                          + ('never finished loading' if seen else 'never appeared'))
+    raise AutoReportError(
+        f'QuickBooks did not finish exporting to Excel within {timeout}s'
+        if seen else 'Excel workbook from QuickBooks never appeared')
 
 
-def drop_unwanted_sheets(wb):
-    names = [wb.Worksheets(i).Name for i in range(1, wb.Worksheets.Count + 1)]
-    log.debug(f'   sheets: {names}')
-    for name in names:
-        if any(name.lower().startswith(p.lower()) for p in DROP_SHEETS):
-            if wb.Worksheets.Count <= 1:
-                log.warning(f'   not deleting "{name}": it is the only sheet')
-                continue
+def drop_tips_sheets(wb):
+    for name in [wb.Worksheets(i).Name for i in range(1, wb.Worksheets.Count + 1)]:
+        if is_tips_sheet(name) and wb.Worksheets.Count > 1:
             excel_call(lambda: wb.Worksheets(name).Delete())
             log.debug(f'   deleted sheet "{name}"')
 
 
+_MONTHS = ('January February March April May June July August '
+           'September October November December').split()
+
+
+def check_report_dates(wb, report, end):
+    '''Look for the quarter-end date in the report's header rows / page header.
+
+    Logs a WARNING if it can't be found, so a wrong date range shows up in
+    the log. (A check only for now: the exact header format QB exports
+    hasn't been confirmed. Each run logs what it found.)'''
+    texts = []
+    try:
+        ws = wb.Worksheets(1)
+        for row in excel_call(lambda: ws.Range('A1:H8').Value) or ():
+            texts += [str(v) for v in row if v not in (None, '')]
+        setup = ws.PageSetup
+        texts += [h for h in (setup.LeftHeader, setup.CenterHeader, setup.RightHeader) if h]
+    except pywintypes.com_error as e:
+        log.debug(f'   could not read report header: {e}')
+        return
+    header = ' | '.join(texts)
+    wanted = (f'{_MONTHS[end.month - 1]} {end.day}, {end.year}',   # September 30, 2026
+              f'{_MONTHS[end.month - 1]} {end.year}',              # September 2026
+              fmt_date(end), end.strftime('%m/%d/%Y'), end.strftime('%m/%d/%y'),
+              end.strftime('%Y-%m-%d'))
+    if any(w in header for w in wanted):
+        log.debug(f'   dates ok in header: {header[:200]}')
+    else:
+        log.warning(f'   ** {report.name}: quarter end {fmt_date(end)} not found '
+                    f'in report header -- CHECK THE DATES. Header: {header[:300]}')
+
+
 def save_and_close(xl, wb, target):
     xl.DisplayAlerts = False        # no "macro-free workbook?" or other prompts
-    drop_unwanted_sheets(wb)
+    drop_tips_sheets(wb)
     excel_call(lambda: wb.Worksheets(1).Activate())
     excel_call(lambda: wb.SaveAs(os.path.abspath(target),
                                  FileFormat=EXCEL_FORMATS[FILE_EXT]))
@@ -597,12 +640,13 @@ def build_combined(saved, target):
         blanks = [combo.Worksheets(i).Name for i in range(1, combo.Worksheets.Count + 1)]
         for name, path in saved:
             src = excel_call(lambda: xl.Workbooks.Open(os.path.abspath(path), ReadOnly=True))
-            count = src.Worksheets.Count
-            for i in range(1, count + 1):
+            keep = [i for i in range(1, src.Worksheets.Count + 1)
+                    if not is_tips_sheet(src.Worksheets(i).Name)]
+            for n, i in enumerate(keep, 1):
                 last = combo.Worksheets(combo.Worksheets.Count)
                 excel_call(lambda: src.Worksheets(i).Copy(Before=None, After=last))
                 copied = combo.Worksheets(combo.Worksheets.Count)
-                copied.Name = sheet_name(name if count == 1 else f'{name} {i}')
+                copied.Name = sheet_name(name if len(keep) == 1 else f'{name} {n}')
                 log.debug(f'   tab "{copied.Name}" <- {os.path.basename(path)}')
             excel_call(lambda: src.Close(SaveChanges=False))
         for blank in blanks:                       # the empty sheets Add() made
@@ -630,9 +674,13 @@ def qb_open_report(index, report, start, end):
     hotkey('alt', 'r')                         # Reports menu
     press(*['down'] * FAVORITES_MENU_DOWNS, 'right')
     press(*['down'] * index, 'enter')          # pick the report
-    wait_until(lambda: qb_report_is_open(report.name), QB_REPORT_TIMEOUT,
-               f'QB report window "{report.name}"', soft=True, minimum=QB_REPORT_MIN,
-               on_miss=lambda: log_window_titles(qb_children=True))
+    found = wait_until(lambda: qb_report_window(report.title), QB_REPORT_TIMEOUT,
+                       f'QB report window "{report.title}"', soft=True,
+                       minimum=2, on_miss=log_qb_windows)
+    if not found:
+        raise AutoReportError(f'The "{report.title}" report window never appeared. '
+                              'Wrong report opened? See the window list above.')
+    time.sleep(QB_REPORT_SETTLE)               # let it finish drawing and take focus
     press('tab')                               # to first date field
 
     if report.date_fields == 2:
@@ -648,19 +696,20 @@ def qb_open_report(index, report, start, end):
 def qb_export():
     '''Step 2: ask QuickBooks to send the report to a new Excel workbook.'''
     log.debug('Step 2: export to Excel')
+    # The "Send Report to Excel" dialog isn't a separate window we can see,
+    # so this uses the original script's proven timing.
     hotkey('alt', 'x')
-    wait_until(lambda: find_window(EXPORT_DIALOG_TITLE), EXPORT_DIALOG_TIMEOUT,
-               f'"{EXPORT_DIALOG_TITLE}" dialog', soft=True, minimum=EXPORT_DIALOG_MIN,
-               on_miss=log_window_titles)
+    time.sleep(1)
     press('n')                                 # "Create new worksheet"
-    time.sleep(2)                              # original script's proven pause
+    time.sleep(2)
     press('enter')
 
 
-def excel_save(target):
-    '''Step 3: tidy, save and close the workbook through Excel itself.'''
+def excel_save(target, report, end):
+    '''Step 3: check, tidy, save and close the workbook through Excel itself.'''
     log.debug('Step 3: save in Excel')
-    xl, wb = wait_for_export_workbook(EXCEL_START_TIMEOUT)
+    xl, wb = wait_for_export_workbook(EXPORT_TIMEOUT)
+    check_report_dates(wb, report, end)
     save_and_close(xl, wb, target)
     wait_file_stable(target)
     wait_closed(is_excel_title, 30, 'Excel')   # soft: next report can still proceed
@@ -672,7 +721,7 @@ def run_report(index, report, start, end, work_dir):
     target = os.path.join(work_dir, f'{FILE_PREFIX} {file_date(end)} {report.name}.{FILE_EXT}')
     qb_open_report(index, report, start, end)
     qb_export()
-    excel_save(target)
+    excel_save(target, report, end)
     log.debug(f'   saved {target}')
     return target
 
