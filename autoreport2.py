@@ -18,7 +18,9 @@ Runs the QuickBooks "Favorite Reports", exports each to Excel and saves it as
   its own automation interface (COM, via pywin32): no Save As dialog, no
   file-type dropdown, no prompts.  Saves plain .xlsx and removes the
   "QuickBooks Export Tips" sheet QB adds.
-* Also builds one combined workbook with every report as its own tab.
+* Also builds one combined workbook with every report as its own tab
+  ("Pembrook 26Q3 Quarterly Reports 261119.xlsx") and copies it up one
+  folder from the scratch output folder, never overwriting an existing file.
 * Waits for windows and for the saved file on disk, instead of fixed sleeps.
 * Every run writes a log to <output folder>/logs/.
 * Failures stop with a clear message; the console waits for Enter.
@@ -31,8 +33,10 @@ Emergency stop: slam the mouse into a screen corner (pyautogui FAILSAFE).
 '''
 
 import datetime as dt
+import glob
 import logging
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -85,7 +89,18 @@ DROP_SHEETS = ('QuickBooks Export Tips',)
 # Also build one workbook with every report as its own tab (tabs named after
 # the reports, in REPORTS order). The separate files are still written.
 COMBINED_WORKBOOK = True
-COMBINED_NAME = 'All Reports'   # -> "Pembrook 260930 All Reports.xlsx"
+
+def combined_name(year, quarter, run_date):
+    # e.g. "Pembrook 26Q3 Quarterly Reports 261119" (run date at the end)
+    return f'{FILE_PREFIX} {year % 100:02d}Q{quarter} Quarterly Reports {run_date:%y%m%d}'
+
+# Copy the combined workbook from the output (scratch) folder to the real
+# folder one level up. Never overwrites: if the name is taken there, adds
+# " v2", " v3", ... The separate per-report files stay in the scratch folder.
+PUBLISH_COMBINED = True
+
+def publish_dir(output_dir):
+    return os.path.dirname(os.path.normpath(output_dir))
 
 def default_output_dir():
     base = os.environ.get('OneDrive') or os.path.expanduser('~')
@@ -419,6 +434,24 @@ def sheet_name(text):
     return text[:31]
 
 
+def publish(src, dest_dir):
+    '''Copy src into dest_dir without ever overwriting. Returns the new path.'''
+    stem, ext = os.path.splitext(os.path.basename(src))
+    n = 1
+    while True:
+        name = f'{stem}{ext}' if n == 1 else f'{stem} v{n}{ext}'
+        dest = os.path.join(dest_dir, name)
+        try:
+            with open(src, 'rb') as fin, open(dest, 'xb') as fout:  # 'x' fails if it exists
+                shutil.copyfileobj(fin, fout)
+        except FileExistsError:
+            log.debug(f'   {name} already exists in {dest_dir}')
+            n += 1
+            continue
+        shutil.copystat(src, dest)
+        return dest
+
+
 def build_combined(saved, target):
     '''Copy the sheets of each saved report into one workbook, one tab per report.
 
@@ -569,14 +602,21 @@ def main():
     try:
         preflight()
         combined = os.path.join(output_dir,
-                                f'{FILE_PREFIX} {file_date(end)} {COMBINED_NAME}')
+                                f'{combined_name(year, quarter, dt.date.today())}.{FILE_EXT}')
         if COMBINED_WORKBOOK:
-            remove_old_outputs(combined)   # never leave a stale combined file
+            # Clear this quarter's old combined files from the scratch folder
+            # only (any run date). The publish folder is never touched.
+            stem = combined_name(year, quarter, dt.date.today())[:-len('YYMMDD')]
+            for old in glob.glob(glob.escape(os.path.join(output_dir, stem)) + '*.xls[xm]'):
+                remove_old_outputs(os.path.splitext(old)[0])
         saved = []
         for i, report in enumerate(REPORTS):
             saved.append((report.name, run_report(i, report, start, end, output_dir)))
         if COMBINED_WORKBOOK:
-            build_combined(saved, f'{combined}.{FILE_EXT}')
+            build_combined(saved, combined)
+            if PUBLISH_COMBINED:
+                dest = publish(combined, publish_dir(output_dir))
+                log.info(f'Published {dest}')
 
         # Back to the QuickBooks home page
         raise_window(QB_TITLE, what='QuickBooks')
