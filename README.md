@@ -32,7 +32,7 @@ it), e.g. `Pembrook 26Q3 Quarterly Reports 261119.xlsx`.
 |---|---|
 | Reports folder (default `OneDrive\Documents\Pembrook\Finance\Pembrook`) | The combined workbook. **Never overwritten:** if the name is taken (e.g. a second run the same day), it is saved as `... v2.xlsx`, `... v3.xlsx`, etc. |
 | `<reports folder>\auto\logs\` | A log of every run |
-| `<reports folder>\auto\working ...\` | Temporary per-report files. Deleted after a successful run; **kept after a failed one** so you can see how far it got |
+| Windows temp folder (`%TEMP%\autoreport ...`) | Temporary per-report files, kept out of OneDrive. Deleted after a successful run; **kept after a failed one** so you can see how far it got (the log gives the path) |
 
 Nothing is put in the reports folder unless every report succeeded.
 
@@ -69,7 +69,8 @@ to match the `REPORTS` list at the top of `autoreport2.py`.
    emergency, move the mouse hard into a corner of the screen.**
 
 If a run fails, fix the problem and **redo the whole run**. You can delete
-the leftover `working ...` folder once you've looked at it.
+the leftover working folder (its path is at the end of the log) once you've
+looked at it.
 
 ### Log files
 
@@ -80,7 +81,7 @@ Check it first if something goes wrong.
 
 Two things in the log deserve attention:
 
-* `** <report>: quarter end ... not found in report header -- CHECK THE DATES`
+* `** <report>: page header does not show ... -- CHECK THE DATES`
   means the exported report may have the wrong date range. Open it and check.
 * `The "<title>" report window never appeared` stops the run. Either the wrong
   report opened (check the Favorites order), or the report's `title` in
@@ -101,7 +102,7 @@ All settings are at the top of `autoreport2.py`:
 | `EXPORT_TIPS_SHEET` | The tips sheet QuickBooks adds when it *finishes* exporting. The script waits for it, then deletes it |
 | `combined_name()` | Name of the combined workbook |
 | `default_reports_dir()` | Default reports folder (under OneDrive) |
-| `WORK_SUBDIR` | Subfolder for logs and working files (`auto`) |
+| `WORK_SUBDIR` | Subfolder of the reports folder that holds `logs\` (`auto`) |
 | `QUARTERS_LISTED` | How many quarters the dialog offers (8) |
 | `*_TIMEOUT` | How long to wait for each window |
 | `pyautogui.PAUSE` | Delay between keystrokes (0.3 s; 0.1 is too fast for QuickBooks) |

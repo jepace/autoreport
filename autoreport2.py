@@ -19,9 +19,10 @@ restructured to fix the issues in CODE_ISSUES.md:
   own automation interface (COM, via pywin32), with no dialogs or prompts.
   Plain .xlsx, with QuickBooks' "Export Tips" sheet removed.
 * Never overwrites: if the name is taken, saves as "... v2.xlsx", etc.
-* The per-report files are made in a temporary working folder under
-  <reports folder>\\auto and deleted after a successful run, so the only
-  file you see is the combined one.  A failed run keeps them for inspection.
+* The per-report files are made in a temporary working folder (in the local
+  temp folder, outside OneDrive) and deleted after a successful run, so the
+  only file you see is the combined one.  A failed run keeps them, and the
+  log says where.
 * Waits for windows and files instead of fixed sleeps.
 * Every run writes a log to <reports folder>\\auto\\logs.
 * A failed run should be redone from the start.
@@ -36,8 +37,10 @@ import ctypes
 import datetime as dt
 import logging
 import os
+import re
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -97,7 +100,7 @@ def default_reports_dir():
     base = os.environ.get('OneDrive') or os.path.expanduser('~')
     return os.path.join(base, 'Documents', 'Pembrook', 'Finance', 'Pembrook')
 
-WORK_SUBDIR = 'auto'       # <reports folder>\auto holds logs and working files
+WORK_SUBDIR = 'auto'       # <reports folder>\auto\logs holds the logs
 QUARTERS_LISTED = 8        # how many quarters the dialog offers
 
 # Waits (seconds).
@@ -609,33 +612,41 @@ _MONTHS = ('January February March April May June July August '
            'September October November December').split()
 
 
-def check_report_dates(wb, report, end):
-    '''Look for the quarter-end date in the report's header rows / page header.
+def page_header_text(ws):
+    '''The report's page header (company, title, date range) as plain text.
+    QB puts it in Excel's Page Setup header; strip Excel's formatting codes
+    like &"Arial,Bold"&14.'''
+    setup = ws.PageSetup
+    raw = ' '.join(h for h in (setup.LeftHeader, setup.CenterHeader, setup.RightHeader) if h)
+    text = re.sub(r'&"[^"]*"|&\d+|&[A-Za-z]', ' ', raw)
+    return ' '.join(text.split())
 
-    Logs a WARNING if it can't be found, so a wrong date range shows up in
-    the log. (A check only for now: the exact header format QB exports
-    hasn't been confirmed. Each run logs what it found.)'''
-    texts = []
+
+def check_report_dates(wb, report, start, end):
+    '''Check the report's date range in its page header, in QB's own wording:
+    "As of September 30, 2026" (one date) or "July through September 2026" /
+    "July 1 through September 30, 2026" (two dates). Only the page header is
+    checked: data rows contain transaction dates that would match by chance.
+    Logs a loud WARNING on a mismatch; does not stop the run.'''
     try:
         ws = next(wb.Worksheets(i) for i in range(1, wb.Worksheets.Count + 1)
                   if not is_tips_sheet(wb.Worksheets(i).Name))
-        for row in excel_call(lambda: ws.Range('A1:H8').Value) or ():
-            texts += [str(v) for v in row if v not in (None, '')]
-        setup = ws.PageSetup
-        texts += [h for h in (setup.LeftHeader, setup.CenterHeader, setup.RightHeader) if h]
-    except pywintypes.com_error as e:
-        log.debug(f'   could not read report header: {e}')
+        header = excel_call(lambda: page_header_text(ws))
+    except (pywintypes.com_error, StopIteration) as e:
+        log.warning(f'   ** {report.name}: could not read the page header to check dates ({e})')
         return
-    header = ' | '.join(texts)
-    wanted = (f'{_MONTHS[end.month - 1]} {end.day}, {end.year}',   # September 30, 2026
-              f'{_MONTHS[end.month - 1]} {end.year}',              # September 2026
-              fmt_date(end), end.strftime('%m/%d/%Y'), end.strftime('%m/%d/%y'),
-              end.strftime('%Y-%m-%d'))
-    if any(w in header for w in wanted):
-        log.debug(f'   dates ok in header: {header[:200]}')
+    s_month, e_month = _MONTHS[start.month - 1], _MONTHS[end.month - 1]
+    if report.date_fields == 1:
+        ok = f'{e_month} {end.day}, {end.year}' in header
     else:
-        log.warning(f'   ** {report.name}: quarter end {fmt_date(end)} not found '
-                    f'in report header -- CHECK THE DATES. Header: {header[:300]}')
+        ok = bool(re.search(rf'\b{s_month}( {start.day})? through {e_month}'
+                            rf'( {end.day},)? {end.year}\b', header))
+    if ok:
+        log.debug(f'   dates ok: {header}')
+    else:
+        log.warning(f'   ** {report.name}: page header does not show '
+                    f'{fmt_date(start) + " - " if report.date_fields == 2 else ""}'
+                    f'{fmt_date(end)} -- CHECK THE DATES. Header: {header or "(empty)"}')
 
 
 def save_and_close(xl, wb, target):
@@ -737,7 +748,8 @@ def qb_export():
         opened = wait_until(lambda: qb_dialog_opened(before), 8,
                             f'"Send Report to Excel" dialog (attempt {attempt})', soft=True)
         if opened:
-            log.debug(f'   export dialog: {opened}')
+            # Diagnostics: which signals fired, to learn which is reliable.
+            log.debug(f'   export dialog: {opened}; QB main window disabled: {qb_busy()}')
             break
         time.sleep(2)                          # QB may still be busy; try once more
     else:
@@ -749,11 +761,11 @@ def qb_export():
     press('enter')
 
 
-def excel_save(target, report, end):
+def excel_save(target, report, start, end):
     '''Step 3: check, tidy, save and close the workbook through Excel itself.'''
     log.debug('Step 3: save in Excel')
     xl, wb = wait_for_export_workbook(EXPORT_TIMEOUT)
-    check_report_dates(wb, report, end)
+    check_report_dates(wb, report, start, end)
     save_and_close(xl, wb, target)
     wait_file_stable(target)
     wait_closed(is_excel_title, 30, 'Excel')   # soft: next report can still proceed
@@ -765,7 +777,7 @@ def run_report(index, report, start, end, work_dir):
     target = os.path.join(work_dir, f'{FILE_PREFIX} {file_date(end)} {report.name}.{FILE_EXT}')
     qb_open_report(index, report, start, end)
     qb_export()
-    excel_save(target, report, end)
+    excel_save(target, report, start, end)
     log.debug(f'   saved {target}')
     return target
 
@@ -813,8 +825,9 @@ def main():
     year, quarter, reports_dir = choice
     stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
     auto_dir = os.path.join(reports_dir, WORK_SUBDIR)
-    work_dir = os.path.join(auto_dir, f'working {year}Q{quarter} {stamp}')
-    os.makedirs(work_dir)
+    # Working files go in the local temp folder, not OneDrive: saving there is
+    # faster and OneDrive doesn't sync files that are about to be deleted.
+    work_dir = tempfile.mkdtemp(prefix=f'autoreport {year}Q{quarter} {stamp} ')
     log_path = setup_logging(os.path.join(auto_dir, 'logs'), year, quarter, stamp)
 
     start, end = quarter_range(year, quarter)
