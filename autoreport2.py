@@ -12,12 +12,13 @@ Runs the QuickBooks "Favorite Reports", exports each to Excel and saves it as
   needs, instead of special-casing names in the code.
 * No date typing: pick a year and calendar quarter (defaults to the most
   recently finished quarter, so normally you just press Enter).
-* Refuses to start if any Excel window is already open, so it can never
-  save or close the wrong workbook.
-* Waits for windows (QB report, Send to Excel dialog, Excel, Save As) and
-  for the saved file on disk, instead of fixed sleeps.
-* Handles a "Save changes?" prompt when closing Excel.
-* File paths are pasted via the clipboard (safe for non-ASCII characters).
+* Refuses to start if Excel is already open, so it can never save or close
+  the wrong workbook.
+* QuickBooks is driven by keystrokes, but Excel is driven directly through
+  its own automation interface (COM, via pywin32): no Save As dialog, no
+  file-type dropdown, no prompts.  Saves plain .xlsx and removes the
+  "QuickBooks Export Tips" sheet QB adds.
+* Waits for windows and for the saved file on disk, instead of fixed sleeps.
 * Every run writes a log to <output folder>/logs/.
 * Failures stop with a clear message; the console waits for Enter.
   A failed run should be redone from the start.
@@ -36,6 +37,8 @@ import time
 from dataclasses import dataclass
 
 import pyautogui
+import pywintypes
+import win32com.client
 import win32gui
 import wx
 
@@ -60,7 +63,6 @@ REPORTS = [
 
 QB_TITLE = 'QuickBooks Desktop Pro 2020'   # substring of the main QB window title
 EXPORT_DIALOG_TITLE = 'Send Report to Excel'
-SAVE_AS_TITLE = 'Save As'
 
 def is_excel_title(title):
     # Excel windows are titled "<workbook> - Excel". Matching the ending
@@ -71,7 +73,13 @@ def is_excel_title(title):
 FAVORITES_MENU_DOWNS = 4
 
 FILE_PREFIX = 'Pembrook'
-FILE_EXT = 'xlsm'          # The script picks the 2nd entry in "Save as type"
+FILE_EXT = 'xlsx'          # 'xlsx' (plain data) or 'xlsm' (keeps QB's macros)
+EXCEL_FORMATS = {'xlsx': 51, 'xlsm': 52}   # Excel's FileFormat codes
+
+# Sheets QuickBooks adds that we don't want. Matched case-insensitively as a
+# prefix of the sheet name. Never deletes the last remaining sheet.
+# Every run logs the sheet names it saw, so check the log if this needs tweaking.
+DROP_SHEETS = ('QuickBooks Export Tips',)
 
 def default_output_dir():
     base = os.environ.get('OneDrive') or os.path.expanduser('~')
@@ -83,7 +91,6 @@ def default_output_dir():
 QB_REPORT_TIMEOUT = 20     # soft: report window opens
 EXPORT_DIALOG_TIMEOUT = 10 # soft: "Send Report to Excel" dialog opens
 EXCEL_START_TIMEOUT = 300  # Excel can be slow to start
-SAVE_TIMEOUT = 90
 
 pyautogui.PAUSE = 0.3      # 0.1 is too fast for QB; 0.3 works
 CONSOLE_DEBUG = True       # show step-by-step detail in the console (log always has it)
@@ -319,17 +326,84 @@ def wait_file_stable(path, timeout=60, settle=2.0):
     raise AutoReportError(f'Saved file never appeared/settled: {path}')
 
 
-def paste_text(text):
-    '''Type text via the clipboard (handles any characters).'''
-    app = wx.GetApp() or wx.App(False)  # noqa: F841
-    if wx.TheClipboard.Open():
+# ----------------------------------------------------------------- excel ---
+
+# Excel refuses COM calls while it is busy (e.g. QB still filling the sheet).
+_EXCEL_BUSY = {-2147418111,   # RPC_E_CALL_REJECTED
+               -2147417846}   # RPC_E_SERVERCALL_RETRYLATER
+
+
+def excel_call(fn, timeout=60):
+    '''Run fn(), retrying while Excel says it is busy.'''
+    deadline = time.time() + timeout
+    while True:
         try:
-            wx.TheClipboard.SetData(wx.TextDataObject(text))
-        finally:
-            wx.TheClipboard.Close()
-        pyautogui.hotkey('ctrl', 'v')
-    else:
-        pyautogui.write(text)  # fallback
+            return fn()
+        except pywintypes.com_error as e:
+            if e.hresult not in _EXCEL_BUSY or time.time() > deadline:
+                raise
+            time.sleep(0.5)
+
+
+def running_excel():
+    '''The running Excel application, or None.'''
+    try:
+        return win32com.client.GetActiveObject('Excel.Application')
+    except pywintypes.com_error:
+        return None
+
+
+def wait_for_export_workbook(timeout):
+    '''Wait for the workbook QuickBooks creates, and for QB to finish filling it.'''
+    def opened():
+        xl = running_excel()
+        try:
+            return xl if xl and excel_call(lambda: xl.Workbooks.Count, 5) > 0 else None
+        except pywintypes.com_error:
+            return None
+    xl = wait_until(opened, timeout, 'Excel workbook from QuickBooks')
+    wb = excel_call(lambda: xl.Workbooks(1))
+
+    # QB writes into the workbook after it opens; wait until it stops changing.
+    def snapshot():
+        sheets = wb.Worksheets
+        return (excel_call(lambda: xl.Ready), sheets.Count,
+                tuple(sheets(i).UsedRange.Address for i in range(1, sheets.Count + 1)))
+    last, since = None, time.time()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        snap = excel_call(snapshot)
+        if snap != last:
+            last, since = snap, time.time()
+        elif snap[0] and time.time() - since >= 2.0:
+            return xl, wb
+        time.sleep(0.5)
+    raise AutoReportError('Excel workbook never finished loading')
+
+
+def drop_unwanted_sheets(wb):
+    names = [wb.Worksheets(i).Name for i in range(1, wb.Worksheets.Count + 1)]
+    log.debug(f'   sheets: {names}')
+    for name in names:
+        if any(name.lower().startswith(p.lower()) for p in DROP_SHEETS):
+            if wb.Worksheets.Count <= 1:
+                log.warning(f'   not deleting "{name}": it is the only sheet')
+                continue
+            excel_call(lambda: wb.Worksheets(name).Delete())
+            log.debug(f'   deleted sheet "{name}"')
+
+
+def save_and_close(xl, wb, target):
+    xl.DisplayAlerts = False        # no "macro-free workbook?" or other prompts
+    drop_unwanted_sheets(wb)
+    excel_call(lambda: wb.Worksheets(1).Activate())
+    excel_call(lambda: wb.SaveAs(os.path.abspath(target),
+                                 FileFormat=EXCEL_FORMATS[FILE_EXT]))
+    log.debug(f'   SaveAs {target}')
+    excel_call(lambda: wb.Close(SaveChanges=False))
+    if excel_call(lambda: xl.Workbooks.Count) == 0:
+        excel_call(xl.Quit)
+    del wb, xl                      # release COM references so Excel can exit
 
 
 def press(*keys):
@@ -380,10 +454,9 @@ def qb_open_report(index, report, start, end):
     time.sleep(1)                              # no window signal for the refresh
 
 
-def export_and_save(base):
-    '''Step 2: send the report to a new Excel workbook and Save As .xlsm.'''
-    log.debug('Step 2: export to Excel and save')
-    target = f'{base}.{FILE_EXT}'
+def qb_export():
+    '''Step 2: ask QuickBooks to send the report to a new Excel workbook.'''
+    log.debug('Step 2: export to Excel')
     hotkey('alt', 'x')
     wait_until(lambda: find_window(EXPORT_DIALOG_TITLE), EXPORT_DIALOG_TIMEOUT,
                f'"{EXPORT_DIALOG_TITLE}" dialog', soft=True)
@@ -391,40 +464,25 @@ def export_and_save(base):
     time.sleep(0.5)
     press('enter')
 
-    raise_window(is_excel_title, EXCEL_START_TIMEOUT, what='Excel')
-    press('f12')
-    raise_window(SAVE_AS_TITLE, what='"Save As" dialog')
-    paste_text(base)                           # extension added by type choice
-    log.debug(f'   pasted {base}')
-    press('tab', 'down', 'home', 'down', 'enter')  # Save as type -> 2nd entry (xlsm)
-    hotkey('alt', 's')
-    if not wait_closed(SAVE_AS_TITLE, SAVE_TIMEOUT, '"Save As"'):
-        raise AutoReportError('"Save As" window did not close')
+
+def excel_save(target):
+    '''Step 3: tidy, save and close the workbook through Excel itself.'''
+    log.debug('Step 3: save in Excel')
+    xl, wb = wait_for_export_workbook(EXCEL_START_TIMEOUT)
+    save_and_close(xl, wb, target)
     wait_file_stable(target)
-    return target
-
-
-def close_excel():
-    '''Step 3: close Excel, answering "Don't Save" if asked (already saved).'''
-    log.debug('Step 3: close Excel')
-    raise_window(is_excel_title, what='Excel')
-    hotkey('alt', 'f4')
-    if wait_closed(is_excel_title, 15, 'Excel'):
-        return
-    log.debug('   Excel still open; answering "Don\'t Save"')
-    hotkey('alt', 'n')
-    if not wait_closed(is_excel_title, 45, 'Excel'):
-        raise AutoReportError('Excel did not close')
+    wait_closed(is_excel_title, 30, 'Excel')   # soft: next report can still proceed
 
 
 def run_report(index, report, start, end, output_dir):
     log.info(f'[{index + 1}/{len(REPORTS)}] {report.name}')
     base = os.path.join(output_dir, f'{FILE_PREFIX} {file_date(end)} {report.name}')
+    target = f'{base}.{FILE_EXT}'
     remove_old_outputs(base)
     qb_open_report(index, report, start, end)
-    target = export_and_save(base)
+    qb_export()
+    excel_save(target)
     log.info(f'   saved {target}')
-    close_excel()
 
 
 # ------------------------------------------------------------------ main ---
@@ -435,6 +493,10 @@ def preflight():
     if open_excel:
         titles = '\n    '.join(w.title for w in open_excel)
         raise AutoReportError('Close all Excel windows before running:\n    ' + titles)
+    xl = running_excel()   # Excel can also be running with no visible window
+    if xl is not None and excel_call(lambda: xl.Workbooks.Count, 5) > 0:
+        raise AutoReportError('Excel is running in the background with workbooks open. '
+                              'Close it (or end EXCEL.EXE in Task Manager) and retry.')
     if not find_window(QB_TITLE):
         raise AutoReportError(f'QuickBooks is not running (no window matching "{QB_TITLE}")')
 
