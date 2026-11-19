@@ -41,10 +41,12 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 
 import pyautogui
+import pythoncom
 import pywintypes
 import win32com.client
 import win32gui
@@ -400,17 +402,20 @@ def qb_dialogs():
     return found
 
 
-def qb_dialog_opened(before):
-    '''Description of a QB dialog that wasn't open in `before`, or None.
-    A modal dialog also disables QB's main window, so that counts too.'''
-    new = {h: t for h, t in qb_dialogs().items() if h not in before}
-    if new:
-        # Window class names show what these untitled windows really are.
-        return 'new windows: ' + ' | '.join(
-            f'{t!r} [{win32gui.GetClassName(h)}]' for h, t in new.items())
-    if qb_busy():
-        return 'QuickBooks main window disabled (modal dialog)'
-    return None
+QB_MENU_CLASS = 'XTPSkinManagerMenu'   # QuickBooks' dropdown-menu windows
+
+
+def new_qb_windows(before, menus):
+    '''{hwnd: "title [class]"} of QB windows not in `before`: only dropdown
+    menus if `menus`, otherwise only non-menu windows (dialogs).'''
+    found = {}
+    for hwnd, title in qb_dialogs().items():
+        if hwnd in before:
+            continue
+        cls = win32gui.GetClassName(hwnd)
+        if (cls == QB_MENU_CLASS) == menus:
+            found[hwnd] = f'{title!r} [{cls}]'
+    return found
 
 
 def log_qb_windows():
@@ -432,10 +437,6 @@ def raise_window(match, timeout=30, what=None):
     win32gui.SetForegroundWindow(window._hWnd)
     time.sleep(0.3)
     return window
-
-
-def wait_closed(match, timeout, what):
-    return wait_until(lambda: not find_windows(match), timeout, f'{what} to close', soft=True)
 
 
 def qb_inner_windows(visible_only=True):
@@ -478,22 +479,6 @@ def hotkey(*keys):
 
 
 # ----------------------------------------------------------------- files ---
-
-def wait_file_stable(path, timeout=60, settle=2.0):
-    '''Wait until path exists and its size stays unchanged for `settle` seconds.'''
-    deadline = time.time() + timeout
-    last_size, stable_since = -1, None
-    while time.time() < deadline:
-        if os.path.isfile(path):
-            size = os.path.getsize(path)
-            if size > 0 and size == last_size:
-                if time.time() - stable_since >= settle:
-                    return
-            else:
-                last_size, stable_since = size, time.time()
-        time.sleep(0.5)
-    raise AutoReportError(f'Saved file never appeared/settled: {path}')
-
 
 def publish(src, dest_dir):
     '''Copy src into dest_dir without ever overwriting. Returns the new path.'''
@@ -669,9 +654,55 @@ def save_and_close(xl, wb, target):
                                  FileFormat=EXCEL_FORMATS[FILE_EXT]))
     log.debug(f'   SaveAs {target}')
     excel_call(lambda: wb.Close(SaveChanges=False))
-    if excel_call(lambda: xl.Workbooks.Count) == 0:
-        excel_call(xl.Quit)
-    del wb, xl                      # release COM references so Excel can exit
+
+
+_excel_closers = []   # background threads shutting Excel instances down
+
+
+def excel_closer(xl):
+    '''A not-yet-started thread that quits this Excel in the background.
+
+    Excel takes up to ~15s to shut down, and dropping our last link to a
+    quitting Excel blocks until it's gone -- that was a 10-15s pause per
+    report. Instead a helper thread quits Excel and does the waiting, while
+    the run carries on. Usage (order matters):
+
+        closer = excel_closer(xl)
+        del xl, wb        # drop our own links while Excel is still running: instant
+        closer.start()'''
+    stream = pythoncom.CoMarshalInterThreadInterfaceInStream(
+        pythoncom.IID_IDispatch, xl._oleobj_)
+
+    def worker():
+        pythoncom.CoInitialize()
+        try:
+            app = win32com.client.Dispatch(pythoncom.CoGetInterfaceAndReleaseStream(
+                stream, pythoncom.IID_IDispatch))
+            t = time.time()
+            if app.Workbooks.Count == 0:   # never quit an Excel that has work open
+                app.Quit()
+            del app
+            log.debug(f'   (background) Excel closed ({time.time() - t:.1f}s)')
+        except Exception as e:
+            log.debug(f'   (background) closing Excel: {e}')
+        finally:
+            pythoncom.CoUninitialize()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    _excel_closers.append(thread)
+    return thread
+
+
+def wait_for_excel_closers(timeout=60):
+    '''At the end of the run, let background Excel shutdowns finish.'''
+    for thread in _excel_closers:
+        thread.join(timeout)
+
+
+def check_saved(path):
+    '''SaveAs is synchronous, so the file must already be there.'''
+    if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+        raise AutoReportError(f'Saved file is missing or empty: {path}')
 
 
 def sheet_name(text):
@@ -689,34 +720,40 @@ def build_combined(saved, target):
     log.info(f'Combining {len(saved)} reports')
     xl = win32com.client.DispatchEx('Excel.Application')
     try:
-        xl.Visible = False
-        xl.DisplayAlerts = False
-        combo = excel_call(lambda: xl.Workbooks.Add())
-        blanks = [combo.Worksheets(i).Name for i in range(1, combo.Worksheets.Count + 1)]
-        for name, path in saved:
-            src = excel_call(lambda: xl.Workbooks.Open(os.path.abspath(path), ReadOnly=True))
-            keep = [i for i in range(1, src.Worksheets.Count + 1)
-                    if not is_tips_sheet(src.Worksheets(i).Name)]
-            for n, i in enumerate(keep, 1):
-                last = combo.Worksheets(combo.Worksheets.Count)
-                excel_call(lambda: src.Worksheets(i).Copy(Before=None, After=last))
-                copied = combo.Worksheets(combo.Worksheets.Count)
-                copied.Name = sheet_name(name if len(keep) == 1 else f'{name} {n}')
-                log.debug(f'   tab "{copied.Name}" <- {os.path.basename(path)}')
-            excel_call(lambda: src.Close(SaveChanges=False))
-        for blank in blanks:                       # the empty sheets Add() made
-            excel_call(lambda: combo.Worksheets(blank).Delete())
-        excel_call(lambda: combo.Worksheets(1).Activate())
-        excel_call(lambda: combo.SaveAs(os.path.abspath(target),
-                                        FileFormat=EXCEL_FORMATS[FILE_EXT]))
-        excel_call(lambda: combo.Close(SaveChanges=False))
+        _fill_combined(xl, saved, target)
     finally:
-        try:
-            xl.Quit()
-        except pywintypes.com_error:
-            pass
+        closer = excel_closer(xl)
         del xl
-    wait_file_stable(target)
+        closer.start()
+    check_saved(target)
+
+
+def _fill_combined(xl, saved, target):
+    '''Build and save the combined workbook in `xl`.
+
+    A separate function so that all its workbook and sheet references are
+    released when it returns, before Excel is asked to quit.'''
+    xl.Visible = False
+    xl.DisplayAlerts = False
+    combo = excel_call(lambda: xl.Workbooks.Add())
+    blanks = [combo.Worksheets(i).Name for i in range(1, combo.Worksheets.Count + 1)]
+    for name, path in saved:
+        src = excel_call(lambda: xl.Workbooks.Open(os.path.abspath(path), ReadOnly=True))
+        keep = [i for i in range(1, src.Worksheets.Count + 1)
+                if not is_tips_sheet(src.Worksheets(i).Name)]
+        for n, i in enumerate(keep, 1):
+            last = combo.Worksheets(combo.Worksheets.Count)
+            excel_call(lambda: src.Worksheets(i).Copy(Before=None, After=last))
+            copied = combo.Worksheets(combo.Worksheets.Count)
+            copied.Name = sheet_name(name if len(keep) == 1 else f'{name} {n}')
+            log.debug(f'   tab "{copied.Name}" <- {os.path.basename(path)}')
+        excel_call(lambda: src.Close(SaveChanges=False))
+    for blank in blanks:                       # the empty sheets Add() made
+        excel_call(lambda: combo.Worksheets(blank).Delete())
+    excel_call(lambda: combo.Worksheets(1).Activate())
+    excel_call(lambda: combo.SaveAs(os.path.abspath(target),
+                                    FileFormat=EXCEL_FORMATS[FILE_EXT]))
+    excel_call(lambda: combo.Close(SaveChanges=False))
 
 
 # ------------------------------------------------------------- the steps ---
@@ -751,28 +788,30 @@ def qb_open_report(index, report, start, end):
 def qb_export():
     '''Step 2: ask QuickBooks to send the report to a new Excel workbook.'''
     log.debug('Step 2: export to Excel')
-    # Never type into the export dialog unless it has visibly opened: if QB
-    # was still busy and ignored Alt+X, the "n" would land in the report
-    # itself (it once changed "Sort By" to "Num").
+    # Alt+X opens the report toolbar's Excel dropdown menu; "n" picks
+    # "Create New Worksheet", which opens the "Send Report to Excel" dialog;
+    # Enter exports. Never press "n" unless the menu has visibly opened: if QB
+    # was busy and ignored Alt+X, the "n" lands in the report itself (it once
+    # changed "Sort By" to "Num").
     before = qb_dialogs()
     for attempt in (1, 2):
         hotkey('alt', 'x')
-        opened = wait_until(lambda: qb_dialog_opened(before), 8,
-                            f'"Send Report to Excel" dialog (attempt {attempt})', soft=True)
-        if opened:
-            # Diagnostics: which signals fired, to learn which is reliable.
-            fg = win32gui.GetForegroundWindow()
-            log.debug(f'   export dialog: {opened}; focused window: '
-                      f'{win32gui.GetWindowText(fg)!r} [{win32gui.GetClassName(fg)}]')
+        menu = wait_until(lambda: new_qb_windows(before, menus=True), 8,
+                          f'Excel menu (attempt {attempt})', soft=True)
+        if menu:
             break
         time.sleep(2)                          # QB may still be busy; try once more
+                                               # (not Esc: that would close the report)
     else:
-        raise AutoReportError('QuickBooks did not open "Send Report to Excel" after '
-                              'Alt+X (twice). Stopped so no keys land in the report.')
-    time.sleep(1)
-    press('n')                                 # "Create new worksheet"
-    time.sleep(2)
-    press('enter')
+        raise AutoReportError('QuickBooks did not open the Excel menu after Alt+X '
+                              '(twice). Stopped so no keys land in the report.')
+    before = qb_dialogs()
+    press('n')                                 # "Create New Worksheet"
+    dialog = wait_until(lambda: new_qb_windows(before, menus=False), 5,
+                        '"Send Report to Excel" dialog', soft=True, minimum=2)
+    if dialog:   # diagnostics: confirms what the dialog looks like
+        log.debug('   dialog: ' + ' | '.join(dialog.values()))
+    press('enter')                             # Export
 
 
 def excel_save(target, report, start, end):
@@ -781,13 +820,10 @@ def excel_save(target, report, start, end):
     xl, wb = wait_for_export_workbook(EXPORT_TIMEOUT)
     check_report_dates(wb, report, start, end)
     save_and_close(xl, wb, target)
-    # Diagnostics: dropping our last link to Excel may wait for Excel to
-    # finish shutting down (suspected cause of a 10-15s pause per report).
-    t = time.time()
-    del xl, wb
-    log.debug(f'   released Excel ({time.time() - t:.1f}s)')
-    wait_file_stable(target)
-    wait_closed(is_excel_title, 30, 'Excel')   # soft: next report can still proceed
+    closer = excel_closer(xl)
+    del xl, wb            # drop our links while Excel is still running: instant
+    closer.start()        # Excel quits in the background; the run carries on
+    check_saved(target)
 
 
 def run_report(index, report, start, end, work_dir):
@@ -872,6 +908,7 @@ def main():
 
 if __name__ == '__main__':
     code = main()
+    wait_for_excel_closers()   # let Excel finish shutting down before we exit
     if code:
         input('Press Enter to close...')
     sys.exit(code)
