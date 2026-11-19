@@ -99,11 +99,14 @@ def default_reports_dir():
 WORK_SUBDIR = 'auto'       # <reports folder>\auto holds logs and working files
 QUARTERS_LISTED = 8        # how many quarters the dialog offers
 
-# Timeouts (seconds). "Soft" waits log a warning and carry on if the window
-# is never seen -- they replace old fixed sleeps whose window titles haven't
-# been confirmed on the real machine yet. Check the log after a first run.
-QB_REPORT_TIMEOUT = 20     # soft: report window opens
-EXPORT_DIALOG_TIMEOUT = 10 # soft: "Send Report to Excel" dialog opens
+# Waits (seconds). Each QB step always waits at least the *_MIN time (the
+# original script's proven fixed sleeps), then up to *_TIMEOUT more for the
+# expected window. If the window is never seen, the log lists the window
+# titles that WERE open, so the expected title can be corrected.
+QB_REPORT_MIN = 2          # report opens and finishes building
+QB_REPORT_TIMEOUT = 6
+EXPORT_DIALOG_MIN = 2      # "Send Report to Excel" dialog
+EXPORT_DIALOG_TIMEOUT = 4
 EXCEL_START_TIMEOUT = 300  # Excel can be slow to start
 
 pyautogui.PAUSE = 0.3      # 0.1 is too fast for QB; 0.3 works
@@ -304,12 +307,22 @@ class InputDialog(wx.Dialog):
         self.EndModal(wx.ID_OK)
 
 
+def _bring_to_front(window):
+    window.Raise()
+    try:
+        win32gui.SetForegroundWindow(window.GetHandle())
+    except Exception:   # Windows may refuse; the dialog is still shown
+        pass
+
+
 def get_input():
     '''Show the dialog. Returns (year, quarter, reports_dir), or None if the user quit.'''
     enable_high_dpi()
     app = wx.App(False)  # noqa: F841  (must exist while the dialog runs)
     dlg = InputDialog(default_reports_dir())
     try:
+        # Launched from a terminal, Windows may open the dialog behind it.
+        wx.CallAfter(_bring_to_front, dlg)
         dlg.ShowModal()
         return dlg.result
     finally:
@@ -338,20 +351,44 @@ def find_window(match):
     return windows[0] if windows else None
 
 
-def wait_until(condition, timeout, what, soft=False):
-    '''Poll condition() until truthy. Raise (or, if soft, warn) on timeout.'''
+def wait_until(condition, timeout, what, soft=False, minimum=0, on_miss=None):
+    '''Poll condition() until truthy. Raise (or, if soft, warn) on timeout.
+
+    minimum: always take at least this long, even if condition is met sooner.
+    on_miss: called on a soft timeout, e.g. to log diagnostics.'''
     start = time.time()
     while True:
         result = condition()
         if result:
             log.debug(f'   ok: {what} ({time.time() - start:.1f}s)')
+            time.sleep(max(0.0, minimum - (time.time() - start)))
             return result
-        if time.time() - start > timeout:
+        if time.time() - start > minimum + timeout:
             if soft:
-                log.warning(f'   did not see {what} within {timeout}s -- continuing')
+                log.warning(f'   did not see {what} -- continuing')
+                if on_miss:
+                    on_miss()
                 return None
             raise AutoReportError(f'Timed out after {timeout}s waiting for {what}')
         time.sleep(0.2)
+
+
+def log_window_titles(qb_children=False):
+    '''Diagnostics: log the titles of open windows (and QB's inner windows).'''
+    titles = sorted({w.title for w in pyautogui.getAllWindows() if w.title.strip()})
+    log.warning('   open windows: ' + ' | '.join(titles))
+    qb = find_window(QB_TITLE) if qb_children else None
+    if qb:
+        inner = []
+        def collect(hwnd, _):
+            text = win32gui.GetWindowText(hwnd).strip()
+            if text and text not in inner:
+                inner.append(text)
+        try:
+            win32gui.EnumChildWindows(qb._hWnd, collect, None)
+        except Exception:
+            pass
+        log.warning('   QuickBooks inner windows: ' + ' | '.join(inner[:40]))
 
 
 def raise_window(match, timeout=30, what=None):
@@ -467,32 +504,51 @@ def running_excel():
         return None
 
 
-def wait_for_export_workbook(timeout):
-    '''Wait for the workbook QuickBooks creates, and for QB to finish filling it.'''
-    def opened():
-        xl = running_excel()
-        try:
-            return xl if xl and excel_call(lambda: xl.Workbooks.Count, 5) > 0 else None
-        except pywintypes.com_error:
-            return None
-    xl = wait_until(opened, timeout, 'Excel workbook from QuickBooks')
-    wb = excel_call(lambda: xl.Workbooks(1))
+def _export_snapshot():
+    '''(xl, wb, state) for the newest open workbook, or None if there isn't one.
 
-    # QB writes into the workbook after it opens; wait until it stops changing.
-    def snapshot():
+    Looked up fresh every time: while exporting, QuickBooks can replace the
+    workbook (or reconnect to Excel), which "disconnects" any reference we
+    held. state captures everything that changes while QB is still writing.'''
+    xl = running_excel()
+    if xl is None:
+        return None
+    try:
+        count = xl.Workbooks.Count
+        if count == 0:
+            return None
+        wb = xl.Workbooks(count)
         sheets = wb.Worksheets
-        return (excel_call(lambda: xl.Ready), sheets.Count,
-                tuple(sheets(i).UsedRange.Address for i in range(1, sheets.Count + 1)))
-    last, since = None, time.time()
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        snap = excel_call(snapshot)
-        if snap != last:
-            last, since = snap, time.time()
-        elif snap[0] and time.time() - since >= 2.0:
-            return xl, wb
+        state = (xl.Ready, wb.FullName, sheets.Count,
+                 tuple(sheets(i).UsedRange.Address for i in range(1, sheets.Count + 1)))
+        return xl, wb, state
+    except pywintypes.com_error as e:
+        log.debug(f'   Excel not ready ({e.args[1] if len(e.args) > 1 else e})')
+        return None
+
+
+def wait_for_export_workbook(timeout, settle=3.0):
+    '''Wait for the workbook QuickBooks creates, and for QB to finish filling it
+    (Excel ready and nothing changing for `settle` seconds).'''
+    start = time.time()
+    last_state, since, seen = None, None, False
+    while time.time() - start < timeout:
+        snap = _export_snapshot()
+        if snap is None:
+            last_state = None                  # gone or busy: start settling over
+        else:
+            xl, wb, state = snap
+            if not seen:
+                log.debug(f'   Excel workbook appeared ({time.time() - start:.1f}s)')
+                seen = True
+            if state != last_state:
+                last_state, since = state, time.time()
+            elif state[0] and time.time() - since >= settle:
+                log.debug(f'   workbook ready: {state[1]} ({time.time() - start:.1f}s)')
+                return xl, wb
         time.sleep(0.5)
-    raise AutoReportError('Excel workbook never finished loading')
+    raise AutoReportError('Excel workbook from QuickBooks '
+                          + ('never finished loading' if seen else 'never appeared'))
 
 
 def drop_unwanted_sheets(wb):
@@ -575,8 +631,8 @@ def qb_open_report(index, report, start, end):
     press(*['down'] * FAVORITES_MENU_DOWNS, 'right')
     press(*['down'] * index, 'enter')          # pick the report
     wait_until(lambda: qb_report_is_open(report.name), QB_REPORT_TIMEOUT,
-               f'QB report window "{report.name}"', soft=True)
-    time.sleep(0.5)                            # let the window take focus
+               f'QB report window "{report.name}"', soft=True, minimum=QB_REPORT_MIN,
+               on_miss=lambda: log_window_titles(qb_children=True))
     press('tab')                               # to first date field
 
     if report.date_fields == 2:
@@ -594,9 +650,10 @@ def qb_export():
     log.debug('Step 2: export to Excel')
     hotkey('alt', 'x')
     wait_until(lambda: find_window(EXPORT_DIALOG_TITLE), EXPORT_DIALOG_TIMEOUT,
-               f'"{EXPORT_DIALOG_TITLE}" dialog', soft=True)
+               f'"{EXPORT_DIALOG_TITLE}" dialog', soft=True, minimum=EXPORT_DIALOG_MIN,
+               on_miss=log_window_titles)
     press('n')                                 # "Create new worksheet"
-    time.sleep(0.5)
+    time.sleep(2)                              # original script's proven pause
     press('enter')
 
 
