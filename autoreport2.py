@@ -10,9 +10,8 @@ Runs the QuickBooks "Favorite Reports", exports each to Excel and saves it as
   menu position, default output folder, timings).
 * Each report declares how many date fields it has and any extra tabs it
   needs, instead of special-casing names in the code.
-* Dates are validated as real calendar dates; the dialog stays open and
-  shows an error until the input is valid.  End date auto-fills to the end
-  of the quarter that starts on the start date.
+* No date typing: pick a year and calendar quarter (defaults to the most
+  recently finished quarter, so normally you just press Enter).
 * The output folder can be chosen in the dialog.
 * Failures raise exceptions with a clear message; the console window waits
   for Enter instead of vanishing.
@@ -89,23 +88,18 @@ def dprint(*args, **kwargs):
 
 # ---------------------------------------------------------------- dates ----
 
-def parse_date(text):
-    '''Parse m/d/yyyy (or m/d/yy). Returns a date or None.'''
-    text = text.strip()
-    for fmt in ('%m/%d/%Y', '%m/%d/%y'):
-        try:
-            return dt.datetime.strptime(text, fmt).date()
-        except ValueError:
-            pass
-    return None
+def quarter_range(year, quarter):
+    '''(first day, last day) of calendar quarter 1-4.'''
+    start = dt.date(year, 3 * quarter - 2, 1)
+    next_start = dt.date(year + 1, 1, 1) if quarter == 4 else dt.date(year, 3 * quarter + 1, 1)
+    return start, next_start - dt.timedelta(days=1)
 
 
-def end_of_quarter(start):
-    '''Last day of the 3-month period beginning on start.'''
-    month = start.month + 3
-    year = start.year + (month - 1) // 12
-    month = (month - 1) % 12 + 1
-    return dt.date(year, month, 1) - dt.timedelta(days=1)
+def last_completed_quarter(today=None):
+    '''(year, quarter) of the most recently finished calendar quarter.'''
+    today = today or dt.date.today()
+    q = (today.month - 1) // 3   # 0 means the last quarter was Q4 of last year
+    return (today.year - 1, 4) if q == 0 else (today.year, q)
 
 
 def fmt_date(d):
@@ -122,22 +116,28 @@ def file_date(d):
 
 class InputDialog(wx.Dialog):
     def __init__(self):
-        super().__init__(None, title='QuickBooks Report Range',
+        super().__init__(None, title='QuickBooks Quarterly Reports',
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.start = self.end = self.output_dir = None
-        self._end_autofilled = True
+        year, quarter = last_completed_quarter()
 
-        self.start_ctrl = wx.TextCtrl(self)
-        self.end_ctrl = wx.TextCtrl(self)
+        self.year_ctrl = wx.SpinCtrl(self, min=2000, max=2100, initial=year)
+        self.quarter_ctrl = wx.RadioBox(self, choices=['Q1', 'Q2', 'Q3', 'Q4'],
+                                        majorDimension=4, style=wx.RA_SPECIFY_COLS)
+        self.quarter_ctrl.SetSelection(quarter - 1)
         self.dir_ctrl = wx.DirPickerCtrl(self, path=default_output_dir(),
                                          style=wx.DIRP_USE_TEXTCTRL)
-        hint = wx.StaticText(self, label='Dates as m/d/yyyy. End date fills in '
-                                         'automatically for a quarter.')
+        self.range_lbl = wx.StaticText(self)
+        self.year_ctrl.Bind(wx.EVT_SPINCTRL, self.update_range)
+        self.year_ctrl.Bind(wx.EVT_TEXT, self.update_range)
+        self.quarter_ctrl.Bind(wx.EVT_RADIOBOX, self.update_range)
+        self.update_range()
 
         grid = wx.FlexGridSizer(cols=2, vgap=10, hgap=10)
         grid.AddGrowableCol(1)
-        for label, ctrl in (('Start Date', self.start_ctrl),
-                            ('End Date', self.end_ctrl),
+        for label, ctrl in (('Year', self.year_ctrl),
+                            ('Quarter', self.quarter_ctrl),
+                            ('Range', self.range_lbl),
                             ('Output Folder', self.dir_ctrl)):
             grid.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
             grid.Add(ctrl, 1, wx.EXPAND)
@@ -151,43 +151,32 @@ class InputDialog(wx.Dialog):
 
         main = wx.BoxSizer(wx.VERTICAL)
         main.Add(grid, 0, wx.EXPAND | wx.ALL, 15)
-        main.Add(hint, 0, wx.LEFT | wx.RIGHT, 15)
         main.Add(buttons, 0, wx.EXPAND | wx.ALL, 15)
         self.SetSizerAndFit(main)
         self.SetSize((max(self.GetSize()[0], 520), -1))
 
         start_btn.SetDefault()
         start_btn.Bind(wx.EVT_BUTTON, self.on_start)
-        self.start_ctrl.Bind(wx.EVT_TEXT, self.on_start_changed)
-        self.end_ctrl.Bind(wx.EVT_TEXT, self.on_end_changed)
         self.Centre()
-        self.start_ctrl.SetFocus()
+        start_btn.SetFocus()   # defaults are usually right: just press Enter
 
-    def on_start_changed(self, event):
-        start = parse_date(self.start_ctrl.GetValue())
-        if start and self._end_autofilled:
-            self.end_ctrl.ChangeValue(fmt_date(end_of_quarter(start)))  # no EVT_TEXT
-        event.Skip()
+    def selected_range(self):
+        return quarter_range(self.year_ctrl.GetValue(), self.quarter_ctrl.GetSelection() + 1)
 
-    def on_end_changed(self, event):
-        self._end_autofilled = not self.end_ctrl.GetValue()  # user took over
-        event.Skip()
-
-    def _error(self, msg, ctrl):
-        wx.MessageBox(msg, 'Invalid input', wx.OK | wx.ICON_ERROR, self)
-        ctrl.SetFocus()
-        ctrl.SelectAll()
+    def update_range(self, event=None):
+        start, end = self.selected_range()
+        self.range_lbl.SetLabel(f'{fmt_date(start)}  -  {fmt_date(end)}')
+        if event:
+            event.Skip()
 
     def on_start(self, event):
-        start = parse_date(self.start_ctrl.GetValue())
-        end = parse_date(self.end_ctrl.GetValue())
+        start, end = self.selected_range()
         out = self.dir_ctrl.GetPath().strip()
-        if not start:
-            return self._error('Start date is not a valid date (m/d/yyyy).', self.start_ctrl)
-        if not end:
-            return self._error('End date is not a valid date (m/d/yyyy).', self.end_ctrl)
-        if end < start:
-            return self._error('End date is before start date.', self.end_ctrl)
+        if end >= dt.date.today():
+            ok = wx.MessageBox(f'{fmt_date(end)} has not passed yet. Run anyway?',
+                               'Quarter not finished', wx.YES_NO | wx.ICON_QUESTION, self)
+            if ok != wx.YES:
+                return
         if not out:
             return wx.MessageBox('Choose an output folder.', 'Invalid input',
                                  wx.OK | wx.ICON_ERROR, self)
